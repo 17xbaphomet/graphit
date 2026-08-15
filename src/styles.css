@@ -1,0 +1,74 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@theme {
+  --color-bg: #12110e;
+  --color-surface: #1a1915;
+  --color-raised: #24221c;
+  --color-fg: #ece7dc;
+  --color-muted: #9a9488;
+  --color-subtle: #6e6a60;
+  --color-accent: #e8e2d4;
+  --color-accent-fg: #141310;
+  --color-border: #2e2c26;
+  --color-paper: #f3eee4;
+  --color-ink: #1a1712;
+  --color-danger: #c45b4a;
+
+  --font-display: "Instrument Serif", "Times New Roman", serif;
+  --font-sans: "Figtree", ui-sans-serif, system-ui, sans-serif;
+
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --radius-xl: 24px;
+
+  --shadow-border: 0 0 0 1px rgb(255 255 255 / 0.08);
+  --tracking-display: -0.03em;
+  --tracking-caps: 0.18em;
+  --max-height-stage: 70vh;
+  --aspect-still: 4 / 3;
+}
+
+@layer base {
+  html {
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  body {
+    background-color: var(--color-bg);
+    color: var(--color-fg);
+    font-family: var(--font-sans);
+  }
+
+  button:not(:disabled),
+  [role="button"]:not(:disabled) {
+    cursor: pointer;
+  }
+
+  h1,
+  h2,
+  h3 {
+    text-wrap: balance;
+  }
+
+  p {
+    text-wrap: pretty;
+  }
+
+  img {
+    outline: 1px solid rgb(255 255 255 / 0.08);
+    outline-offset: -1px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

@@ -1,0 +1,73 @@
+export type AnalyzeParams = {
+  maxSize: number;
+  /** 0–100: share of peak Sobel magnitude treated as a line. */
+  edgeThreshold: number;
+  /** 0–255: pixels darker than this are inked as drawn strokes. */
+  inkThreshold: number;
+  includeInk: boolean;
+  /** Drop line strokes shorter than this (pixels). */
+  minStroke: number;
+  /** Number of tone bins, darkest first. */
+  levels: number;
+};
+
+export type ToneLayer = {
+  /** Representative gray, 0 = black. */
+  value: number;
+  /** Pixel indices in drawing order (same stroke-tour as the lines). */
+  pixels: Uint32Array;
+};
+
+export type GraphiteJob = {
+  width: number;
+  height: number;
+  /** Original RGBA, length width * height * 4. */
+  rgba: Uint8ClampedArray;
+  /** Luminance 0–255 per pixel. */
+  gray: Uint8Array;
+  /** Pixel indices in drawing order. */
+  lineOrder: Uint32Array;
+  /** All tone pixels in draw order (darkest layer first). */
+  toneOrder: Uint32Array;
+  /** Darkest → lightest. */
+  layers: ToneLayer[];
+  /** Compact layer index per pixel (0 = darkest). */
+  pixelLevel: Uint8Array;
+  paper: [number, number, number, number];
+  ink: [number, number, number, number];
+};
+
+export type Timeline = {
+  lineMs: number;
+  /** Duration to draw all tone levels, darkest first. */
+  toneMs: number;
+  holdMs: number;
+};
+
+export type PhaseKind = "lines" | "tones" | "hold";
+
+export type PhaseInfo = {
+  kind: PhaseKind;
+  label: string;
+  /** 0–1 within this phase. */
+  local: number;
+  /** 0–1 over the whole clip. */
+  global: number;
+  layerIndex: number;
+  layerCount: number;
+};
+
+export const DEFAULT_PARAMS: AnalyzeParams = {
+  maxSize: 680,
+  edgeThreshold: 16,
+  inkThreshold: 38,
+  includeInk: true,
+  minStroke: 3,
+  levels: 10,
+};
+
+export const DEFAULT_TIMELINE: Timeline = {
+  lineMs: 4800,
+  toneMs: 7200,
+  holdMs: 1600,
+};
