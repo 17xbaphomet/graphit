@@ -46,7 +46,7 @@ export function TimelineTrack({
     originX: number;
     moved: boolean;
   } | null>(null);
-  const span = Math.max(dragSpan ?? duration + 4000, 1000);
+  const span = Math.max(dragSpan ?? duration, 1000);
   const playLeft = Math.min(100, (tMs / span) * 100);
 
   const anchorsFor = (id: string) => {

@@ -26,7 +26,7 @@ import {
   nextStartMs,
   suggestFrame,
 } from "@/lib/graphite/compose";
-import { downloadBlob, exportCompositionWebM } from "@/lib/graphite/export";
+import { downloadBlob, exportCompositionWebM, exportDurationMs } from "@/lib/graphite/export";
 import {
   DEFAULT_PARAMS,
   DEFAULT_STAGE,
@@ -431,7 +431,7 @@ export function Studio() {
                 <div className="flex items-center gap-2 text-sm font-medium">
                   <LoaderCircle className="size-4 animate-spin" />
                   {exporting
-                    ? `Export ${Math.round(exportRatio * 100)}%`
+                    ? `Export ${Math.round(exportRatio * 100)}% · ${formatMs(exportDurationMs(duration))}`
                     : busyLabel}
                 </div>
               </div>
