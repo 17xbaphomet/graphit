@@ -44,6 +44,44 @@ export type Timeline = {
   holdMs: number;
 };
 
+export type FrameRect = {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+};
+
+export type Plate = {
+  id: string;
+  name: string;
+  source: File | string;
+  thumb: string;
+  frame: FrameRect;
+  startMs: number;
+  params: AnalyzeParams;
+  timeline: Timeline;
+  applied: AnalyzeParams;
+  job: GraphiteJob | null;
+  /** 0–100: paper and near-white become see-through so overlaps keep the drawing below. */
+  transparency: number;
+};
+
+export type StageSize = {
+  width: number;
+  height: number;
+};
+
+export const STAGE_PRESETS = [
+  { label: "HD", width: 1280, height: 720 },
+  { label: "FHD", width: 1920, height: 1080 },
+  { label: "QHD", width: 2560, height: 1440 },
+  { label: "4K", width: 3840, height: 2160 },
+] as const;
+
+export const DEFAULT_STAGE: StageSize = { width: 1280, height: 720 };
+
+export const STAGE_PAPER: [number, number, number, number] = [243, 238, 228, 255];
+
 export type PhaseKind = "lines" | "tones" | "hold";
 
 export type PhaseInfo = {

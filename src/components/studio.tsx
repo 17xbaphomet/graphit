@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import {
+  ChevronDown,
+  ChevronUp,
   Download,
   ImagePlus,
   LoaderCircle,
@@ -7,42 +9,42 @@ import {
   PenLine,
   Play,
   RotateCcw,
+  Trash2,
 } from "lucide-react";
 import { toast } from "sonner";
 import { AuthSlot } from "@/components/auth-slot";
+import { FrameOverlay } from "@/components/frame-overlay";
+import { TimelineTrack } from "@/components/timeline-track";
 import { Button } from "@/components/ui/button";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
 import { Slider } from "@/components/ui/slider";
 import { analyzeSource } from "@/lib/graphite/analyze";
-import { downloadBlob, exportWebM } from "@/lib/graphite/export";
-import { GraphiteRenderer, totalDuration } from "@/lib/graphite/render";
+import {
+  StageRenderer,
+  compositionDuration,
+  nextStartMs,
+  suggestFrame,
+} from "@/lib/graphite/compose";
+import { downloadBlob, exportCompositionWebM } from "@/lib/graphite/export";
 import {
   DEFAULT_PARAMS,
+  DEFAULT_STAGE,
   DEFAULT_TIMELINE,
+  STAGE_PRESETS,
   type AnalyzeParams,
-  type GraphiteJob,
+  type FrameRect,
   type PhaseInfo,
+  type Plate,
+  type StageSize,
   type Timeline,
 } from "@/lib/graphite/types";
 import { cn } from "@/lib/utils";
 
 const SAMPLES = [
-  {
-    id: "atelier",
-    label: "Atelier",
-    src: "/samples/atelier.jpg",
-  },
-  {
-    id: "kathedrale",
-    label: "Kathedrale",
-    src: "/samples/kathedrale.jpg",
-  },
-  {
-    id: "alpen",
-    label: "Alpen",
-    src: "/samples/alpen.jpg",
-  },
+  { id: "atelier", label: "Atelier", src: "/samples/atelier.jpg" },
+  { id: "kathedrale", label: "Kathedrale", src: "/samples/kathedrale.jpg" },
+  { id: "alpen", label: "Alpen", src: "/samples/alpen.jpg" },
 ] as const;
 
 type ViewMode = "animation" | "lines" | "original";
@@ -66,85 +68,142 @@ const SIZE_PRESETS = [
   { label: "4K", size: 3840 },
 ] as const;
 
+function newId() {
+  return `p-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
+}
+
+function sourceName(source: File | string, fallback: string) {
+  if (typeof source !== "string") return source.name.replace(/\.[^.]+$/, "");
+  const sample = SAMPLES.find((s) => s.src === source);
+  return sample?.label ?? fallback;
+}
+
+function makePlate(
+  source: File | string,
+  existing: Plate[],
+  extras?: Partial<Plate>,
+): Plate {
+  const thumb = typeof source === "string" ? source : URL.createObjectURL(source);
+  return {
+    id: newId(),
+    name: sourceName(source, `Bild ${existing.length + 1}`),
+    source,
+    thumb,
+    frame: suggestFrame(existing.map((p) => p.frame)),
+    startMs: nextStartMs(existing),
+    params: { ...DEFAULT_PARAMS },
+    timeline: { ...DEFAULT_TIMELINE },
+    applied: { ...DEFAULT_PARAMS },
+    job: null,
+    transparency: 100,
+    ...extras,
+  };
+}
+
 export function Studio() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const rendererRef = useRef<GraphiteRenderer | null>(null);
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const stageRef = useRef<StageRenderer | null>(null);
   const clockRef = useRef({ playing: false, origin: 0, t: 0 });
   const fileRef = useRef<HTMLInputElement>(null);
-  const sourceRef = useRef<File | string>(SAMPLES[0].src);
-  const paramsRef = useRef(DEFAULT_PARAMS);
-  const timelineRef = useRef(DEFAULT_TIMELINE);
+  const platesRef = useRef<Plate[]>([]);
+  const genRef = useRef(0);
 
-  const [params, setParams] = useState<AnalyzeParams>(DEFAULT_PARAMS);
-  const [timeline, setTimeline] = useState<Timeline>(DEFAULT_TIMELINE);
-  const [job, setJob] = useState<GraphiteJob | null>(null);
+  const [plates, setPlates] = useState<Plate[]>([]);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [stage, setStage] = useState<StageSize>(DEFAULT_STAGE);
   const [busy, setBusy] = useState(true);
+  const [busyLabel, setBusyLabel] = useState("Bild wird gelesen");
   const [exporting, setExporting] = useState(false);
   const [exportRatio, setExportRatio] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [tMs, setTMs] = useState(0);
   const [phase, setPhase] = useState<PhaseInfo | null>(null);
   const [view, setView] = useState<ViewMode>("animation");
-  const [activeSample, setActiveSample] = useState<string>("atelier");
   const [error, setError] = useState<string | null>(null);
-  const [applied, setApplied] = useState<AnalyzeParams>(DEFAULT_PARAMS);
   const [loop, setLoop] = useState(false);
 
-  paramsRef.current = params;
-  timelineRef.current = timeline;
+  platesRef.current = plates;
+  const selected = plates.find((p) => p.id === selectedId) ?? plates[0] ?? null;
+  const duration = compositionDuration(plates);
+  const ready = plates.some((p) => p.job);
+  const dirty = selected
+    ? selected.params.maxSize !== selected.applied.maxSize ||
+      selected.params.edgeThreshold !== selected.applied.edgeThreshold ||
+      selected.params.inkThreshold !== selected.applied.inkThreshold ||
+      selected.params.includeInk !== selected.applied.includeInk ||
+      selected.params.minStroke !== selected.applied.minStroke ||
+      selected.params.levels !== selected.applied.levels
+    : false;
 
-  const duration = job ? totalDuration(job, timeline) : 1;
-  const dirty =
-    params.maxSize !== applied.maxSize ||
-    params.edgeThreshold !== applied.edgeThreshold ||
-    params.inkThreshold !== applied.inkThreshold ||
-    params.includeInk !== applied.includeInk ||
-    params.minStroke !== applied.minStroke ||
-    params.levels !== applied.levels;
-
-  const paint = useCallback((ms: number, mode: ViewMode) => {
-    const renderer = rendererRef.current;
+  const paint = useCallback((ms: number, mode: ViewMode, list = platesRef.current) => {
+    const renderer = stageRef.current;
     if (!renderer) return;
-    if (mode === "lines") {
-      renderer.drawLinesOnly();
-      return;
-    }
-    if (mode === "original") {
-      renderer.drawOriginal();
-      return;
-    }
-    setPhase(renderer.draw(ms));
+    setPhase(renderer.draw(list, ms, mode));
   }, []);
 
-  const attachJob = useCallback((next: GraphiteJob, nextTimeline: Timeline) => {
+  const ensureStage = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
-    if (!rendererRef.current) {
-      rendererRef.current = new GraphiteRenderer(canvas, next, nextTimeline);
+    if (!stageRef.current) {
+      stageRef.current = new StageRenderer(canvas, stage);
     } else {
-      rendererRef.current.attach(next, nextTimeline);
+      stageRef.current.resize(stage);
     }
+  }, [stage]);
+
+  const analyzePlate = useCallback(async (plate: Plate) => {
+    const job = await analyzeSource(plate.source, plate.params);
+    return {
+      ...plate,
+      job,
+      applied: { ...plate.params },
+    } satisfies Plate;
   }, []);
 
-  const runAnalyze = useCallback(
-    async (source: File | string, nextParams = paramsRef.current) => {
-      sourceRef.current = source;
+  const addSources = useCallback(
+    async (sources: { source: File | string; name?: string }[]) => {
+      if (sources.length === 0) return;
+      const gen = ++genRef.current;
       setBusy(true);
       setError(null);
       setPlaying(false);
       clockRef.current.playing = false;
+      const created: Plate[] = [];
       try {
-        await new Promise((r) => window.setTimeout(r, 40));
-        const next = await analyzeSource(source, nextParams);
-        setJob(next);
-        setApplied(nextParams);
-        attachJob(next, timelineRef.current);
+        await new Promise((r) => window.setTimeout(r, 30));
+        let working = [...platesRef.current];
+        for (let i = 0; i < sources.length; i++) {
+          setBusyLabel(
+            sources.length > 1
+              ? `Bild ${i + 1}/${sources.length} wird gelesen`
+              : "Bild wird gelesen",
+          );
+          const plate = makePlate(sources[i]!.source, working, {
+            name: sources[i]!.name ?? sourceName(sources[i]!.source, `Bild ${working.length + 1}`),
+          });
+          const done = await analyzePlate(plate);
+          if (gen !== genRef.current) {
+            if (done.thumb.startsWith("blob:")) URL.revokeObjectURL(done.thumb);
+            return false;
+          }
+          working = [...working, done];
+          created.push(done);
+        }
+        if (gen !== genRef.current) return false;
+        platesRef.current = working;
+        setPlates(working);
+        setSelectedId(created[created.length - 1]!.id);
+        ensureStage();
         clockRef.current.t = 0;
         setTMs(0);
         setView("animation");
-        paint(0, "animation");
+        paint(0, "animation", working);
         return true;
       } catch (err) {
+        created.forEach((p) => {
+          if (p.thumb.startsWith("blob:")) URL.revokeObjectURL(p.thumb);
+        });
         const message =
           err instanceof Error ? err.message : "Analyse fehlgeschlagen";
         setError(message);
@@ -154,23 +213,26 @@ export function Studio() {
         setBusy(false);
       }
     },
-    [attachJob, paint],
+    [analyzePlate, ensureStage, paint],
   );
 
   useEffect(() => {
-    void runAnalyze(SAMPLES[0].src).then((ok) => {
-      if (ok) setPlaying(true);
-    });
-  }, [runAnalyze]);
+    void addSources([{ source: SAMPLES[0].src, name: SAMPLES[0].label }]).then(
+      (ok) => {
+        if (ok) setPlaying(true);
+      },
+    );
+    // initial load only
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
-    if (!job) return;
-    attachJob(job, timeline);
+    ensureStage();
     paint(clockRef.current.t, view);
-  }, [attachJob, job, paint, timeline, view]);
+  }, [ensureStage, paint, plates, stage, view]);
 
   useEffect(() => {
-    if (!playing || !job || view !== "animation") return;
+    if (!playing || !ready || view !== "animation") return;
     clockRef.current.playing = true;
     clockRef.current.origin = performance.now() - clockRef.current.t;
     let raf = 0;
@@ -178,7 +240,7 @@ export function Studio() {
     const tick = (now: number) => {
       if (!clockRef.current.playing) return;
       const t = now - clockRef.current.origin;
-      const cap = totalDuration(job, timeline);
+      const cap = compositionDuration(platesRef.current);
       if (t >= cap) {
         if (loop) {
           clockRef.current.origin = now;
@@ -207,7 +269,7 @@ export function Studio() {
       clockRef.current.playing = false;
       cancelAnimationFrame(raf);
     };
-  }, [job, loop, paint, playing, timeline, view]);
+  }, [loop, paint, playing, ready, view]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -215,9 +277,9 @@ export function Studio() {
       const tag = (e.target as HTMLElement | null)?.tagName;
       if (tag === "INPUT" || tag === "TEXTAREA" || tag === "BUTTON") return;
       e.preventDefault();
-      if (!job || busy || exporting) return;
+      if (!ready || busy || exporting) return;
       setView("animation");
-      if (clockRef.current.t >= totalDuration(job, timeline) - 16) {
+      if (clockRef.current.t >= compositionDuration(platesRef.current) - 16) {
         clockRef.current.t = 0;
         setTMs(0);
       }
@@ -225,7 +287,7 @@ export function Studio() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [busy, exporting, job, timeline]);
+  }, [busy, exporting, ready]);
 
   const seek = (ms: number) => {
     const next = Math.max(0, Math.min(duration, ms));
@@ -236,43 +298,59 @@ export function Studio() {
     paint(next, "animation");
   };
 
-  const replay = () => {
-    seek(0);
-    setPlaying(true);
+  const updatePlate = (id: string, patch: Partial<Plate>) => {
+    setPlates((list) =>
+      list.map((p) => (p.id === id ? { ...p, ...patch } : p)),
+    );
   };
 
-  const loadSample = (src: string, id: string) => {
-    setActiveSample(id);
-    void runAnalyze(src).then((ok) => {
-      if (ok) setPlaying(true);
+  const reprocessSelected = async () => {
+    if (!selected) return;
+    setBusy(true);
+    setBusyLabel("Bild wird gelesen");
+    setPlaying(false);
+    try {
+      const next = await analyzePlate(selected);
+      setPlates((list) => list.map((p) => (p.id === selected.id ? next : p)));
+      paint(clockRef.current.t, view);
+      setPlaying(true);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Analyse fehlgeschlagen");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const removePlate = (id: string) => {
+    setPlates((list) => {
+      const gone = list.find((p) => p.id === id);
+      if (gone?.thumb.startsWith("blob:")) URL.revokeObjectURL(gone.thumb);
+      stageRef.current?.dropPlate(id);
+      const next = list.filter((p) => p.id !== id);
+      if (selectedId === id) setSelectedId(next[0]?.id ?? null);
+      return next;
     });
   };
 
-  const onFile = (file: File | undefined) => {
-    if (!file) return;
-    setActiveSample("");
-    void runAnalyze(file).then((ok) => {
-      if (ok) setPlaying(true);
-    });
-  };
-
-  const applyParams = (patch: Partial<AnalyzeParams>) => {
-    setParams((prev) => ({ ...prev, ...patch }));
-  };
-
-  const reprocess = () => {
-    void runAnalyze(sourceRef.current, params).then((ok) => {
-      if (ok) setPlaying(true);
+  const movePlate = (id: string, dir: -1 | 1) => {
+    setPlates((list) => {
+      const i = list.findIndex((p) => p.id === id);
+      const j = i + dir;
+      if (i < 0 || j < 0 || j >= list.length) return list;
+      const copy = [...list];
+      const [item] = copy.splice(i, 1);
+      copy.splice(j, 0, item!);
+      return copy;
     });
   };
 
   const onExport = async () => {
-    if (!job) return;
+    if (!ready) return;
     setExporting(true);
     setExportRatio(0);
     setPlaying(false);
     try {
-      const blob = await exportWebM(job, timeline, setExportRatio);
+      const blob = await exportCompositionWebM(stage, plates, setExportRatio);
       downloadBlob(blob, `graphit-${Date.now()}.webm`);
       toast.success("Video gespeichert");
     } catch (err) {
@@ -280,6 +358,11 @@ export function Studio() {
     } finally {
       setExporting(false);
     }
+  };
+
+  const onFiles = (list: FileList | null) => {
+    if (!list?.length) return;
+    void addSources([...list].map((file) => ({ source: file })));
   };
 
   return (
@@ -293,9 +376,8 @@ export function Studio() {
             Graphit
           </h1>
           <p className="mt-3 max-w-md text-pretty text-sm leading-normal text-muted">
-            Zuerst die schwarzen Linien, als würde eine Hand sie ziehen. Dann
-            die Tonwerte — dunkel zuerst — mit derselben Zeichenhand, Fläche
-            für Fläche.
+            Mehrere Bilder auf einer Fläche. Rahmen ziehen und skalieren, Start
+            und alle Zeichenparameter je Bild.
           </p>
         </div>
         <div className="flex items-center gap-3">
@@ -306,33 +388,51 @@ export function Studio() {
             onClick={() => fileRef.current?.click()}
           >
             <ImagePlus />
-            Bild laden
+            Bilder laden
           </Button>
           <input
             ref={fileRef}
             type="file"
             accept="image/*"
+            multiple
             className="sr-only"
-            onChange={(e) => onFile(e.target.files?.[0])}
+            onChange={(e) => onFiles(e.target.files)}
           />
         </div>
       </header>
 
       <div className="grid items-start gap-5 lg:grid-cols-[minmax(0,1fr)_20rem]">
         <section className="rounded-xl bg-surface p-2 shadow-border">
-          <div className="relative overflow-hidden rounded-lg bg-paper">
+          <div
+            ref={wrapRef}
+            className="relative overflow-hidden rounded-lg bg-paper"
+          >
             <canvas
               ref={canvasRef}
-              className="mx-auto block h-auto max-h-stage w-full bg-paper object-contain"
-              aria-label="Zeichenvorschau"
+              className="mx-auto block h-auto max-h-stage w-full bg-paper"
+              aria-label="Zeichenfläche"
+            />
+            <FrameOverlay
+              wrapRef={wrapRef}
+              canvasRef={canvasRef}
+              plates={plates}
+              selectedId={selected?.id ?? null}
+              onSelect={(id) => {
+                setPlaying(false);
+                setSelectedId(id);
+              }}
+              onChangeFrame={(id, frame: FrameRect) => {
+                setPlaying(false);
+                updatePlate(id, { frame });
+              }}
             />
             {(busy || exporting) && (
-              <div className="absolute inset-0 grid place-items-center bg-paper/70 text-ink">
+              <div className="absolute inset-0 z-20 grid place-items-center bg-paper/70 text-ink">
                 <div className="flex items-center gap-2 text-sm font-medium">
                   <LoaderCircle className="size-4 animate-spin" />
                   {exporting
                     ? `Export ${Math.round(exportRatio * 100)}%`
-                    : "Bild wird gelesen"}
+                    : busyLabel}
                 </div>
               </div>
             )}
@@ -344,12 +444,12 @@ export function Studio() {
                 type="button"
                 size="sm"
                 onClick={() => {
-                  if (!job) return;
+                  if (!ready) return;
                   setView("animation");
                   if (clockRef.current.t >= duration - 16) seek(0);
                   setPlaying((p) => !p);
                 }}
-                disabled={!job || busy || exporting}
+                disabled={!ready || busy || exporting}
               >
                 {playing ? <Pause /> : <Play />}
                 {playing ? "Pause" : "Abspielen"}
@@ -358,8 +458,11 @@ export function Studio() {
                 type="button"
                 size="sm"
                 variant="secondary"
-                onClick={replay}
-                disabled={!job || busy || exporting}
+                onClick={() => {
+                  seek(0);
+                  setPlaying(true);
+                }}
+                disabled={!ready || busy || exporting}
               >
                 <RotateCcw />
                 Nochmal
@@ -369,7 +472,7 @@ export function Studio() {
                 size="sm"
                 variant="outline"
                 onClick={() => void onExport()}
-                disabled={!job || busy || exporting}
+                disabled={!ready || busy || exporting}
               >
                 <Download />
                 WebM
@@ -415,25 +518,43 @@ export function Studio() {
                   setPlaying(false);
                   seek(v[0] ?? 0);
                 }}
-                disabled={!job || busy || exporting}
+                disabled={!ready || busy || exporting}
               />
               <span className="w-10 shrink-0 text-right text-xs tabular-nums text-subtle">
                 {formatMs(duration)}
               </span>
             </div>
 
+            {plates.length > 0 && (
+              <TimelineTrack
+                plates={plates}
+                selectedId={selected?.id ?? null}
+                tMs={tMs}
+                duration={duration}
+                disabled={busy || exporting}
+                onSelect={setSelectedId}
+                onSeek={(ms) => {
+                  setPlaying(false);
+                  seek(ms);
+                }}
+                onMoveStart={(id, startMs) => {
+                  setPlaying(false);
+                  updatePlate(id, { startMs });
+                }}
+              />
+            )}
+
             <div className="flex items-center justify-between gap-3 text-xs text-muted">
-              <span className="inline-flex items-center gap-1.5">
-                <PenLine className="size-3.5" />
-                {phase?.label ?? "Bereit"}
+              <span className="inline-flex min-w-0 items-center gap-1.5">
+                <PenLine className="size-3.5 shrink-0" />
+                <span className="truncate">{phase?.label ?? "Bereit"}</span>
               </span>
-              {job && (
-                <span className="tabular-nums text-subtle">
-                  {job.width}×{job.height} ·{" "}
-                  {job.lineOrder.length.toLocaleString("de-DE")} Linien ·{" "}
-                  {job.layers.length} Töne
-                </span>
-              )}
+              <span className="shrink-0 tabular-nums text-subtle">
+                {stage.width}×{stage.height}
+                {selected?.job
+                  ? ` · ${selected.job.width}×${selected.job.height}`
+                  : ""}
+              </span>
             </div>
             {error && <p className="text-xs text-danger">{error}</p>}
           </div>
@@ -441,60 +562,16 @@ export function Studio() {
 
         <aside className="flex flex-col gap-5 rounded-xl bg-surface p-4 shadow-border md:p-5">
           <div>
-            <Label>Vorlagen</Label>
-            <div className="mt-2 grid grid-cols-3 gap-2">
-              {SAMPLES.map((s) => (
+            <Label>Fläche</Label>
+            <div className="mt-2 flex flex-wrap gap-1.5">
+              {STAGE_PRESETS.map((p) => (
                 <button
-                  key={s.id}
+                  key={p.label}
                   type="button"
-                  onClick={() => loadSample(s.src, s.id)}
-                  className={cn(
-                    "overflow-hidden rounded-md text-left shadow-border transition-[box-shadow,transform] duration-150 active:scale-[0.96]",
-                    activeSample === s.id && "ring-1 ring-fg/40",
-                  )}
-                >
-                  <img
-                    src={s.src}
-                    alt={s.label}
-                    className="aspect-still w-full object-cover"
-                  />
-                  <span className="block px-2 py-1.5 text-xs font-medium text-fg">
-                    {s.label}
-                  </span>
-                </button>
-              ))}
-            </div>
-          </div>
-
-          <Separator />
-
-          <fieldset className="flex flex-col gap-4">
-            <legend className="text-xs font-medium tracking-wide text-muted">
-              Bild
-            </legend>
-            <Field
-              label="Auflösung"
-              value={formatSize(params.maxSize)}
-            >
-              <Slider
-                min={360}
-                max={3840}
-                step={40}
-                value={[params.maxSize]}
-                onValueChange={(v) =>
-                  applyParams({ maxSize: v[0] ?? 680 })
-                }
-              />
-            </Field>
-            <div className="flex flex-wrap gap-1.5">
-              {SIZE_PRESETS.map((p) => (
-                <button
-                  key={p.size}
-                  type="button"
-                  onClick={() => applyParams({ maxSize: p.size })}
+                  onClick={() => setStage({ width: p.width, height: p.height })}
                   className={cn(
                     "h-8 rounded-md px-2.5 text-xs font-medium shadow-border transition-colors",
-                    params.maxSize === p.size
+                    stage.width === p.width
                       ? "bg-fg text-bg"
                       : "bg-raised text-muted hover:text-fg",
                   )}
@@ -503,146 +580,383 @@ export function Studio() {
                 </button>
               ))}
             </div>
-            <p className="text-xs leading-normal text-subtle">
-              Längste Seite, bis 3840 px (4K UHD). Höher wird schärfer, die
-              Erkennung und der Export dauern länger.
-              {job ? ` Aktuell ${job.width}×${job.height}.` : ""}
+            <p className="mt-2 text-xs leading-normal text-subtle">
+              Ausgabe der Komposition. Rahmen gelten relativ zur Fläche.
             </p>
-          </fieldset>
+          </div>
 
           <Separator />
 
-          <fieldset className="flex flex-col gap-4">
-            <legend className="text-xs font-medium tracking-wide text-muted">
-              Ablauf
-            </legend>
-            <Field label="Liniendauer" value={formatMs(timeline.lineMs)}>
-              <Slider
-                min={1200}
-                max={9000}
-                step={100}
-                value={[timeline.lineMs]}
-                onValueChange={(v) =>
-                  setTimeline((t) => ({ ...t, lineMs: v[0] ?? t.lineMs }))
-                }
-              />
-            </Field>
-            <Field label="Töne" value={formatMs(timeline.toneMs)}>
-              <Slider
-                min={2400}
-                max={14000}
-                step={100}
-                value={[timeline.toneMs]}
-                onValueChange={(v) =>
-                  setTimeline((t) => ({ ...t, toneMs: v[0] ?? t.toneMs }))
-                }
-              />
-            </Field>
-            <Field label="Halten" value={formatMs(timeline.holdMs)}>
-              <Slider
-                min={400}
-                max={5000}
-                step={100}
-                value={[timeline.holdMs]}
-                onValueChange={(v) =>
-                  setTimeline((t) => ({ ...t, holdMs: v[0] ?? t.holdMs }))
-                }
-              />
-            </Field>
-            <label className="flex min-h-11 items-center gap-3 text-sm text-fg">
-              <input
-                type="checkbox"
-                checked={loop}
-                onChange={(e) => setLoop(e.target.checked)}
-                className="size-4 accent-fg"
-              />
-              In Schleife abspielen
-            </label>
-          </fieldset>
-
-          <Separator />
-
-          <fieldset className="flex flex-col gap-4">
-            <legend className="text-xs font-medium tracking-wide text-muted">
-              Erkennung
-            </legend>
-            <Field label="Tonstufen" value={String(params.levels)}>
-              <Slider
-                min={4}
-                max={16}
-                step={1}
-                value={[params.levels]}
-                onValueChange={(v) => applyParams({ levels: v[0] ?? 10 })}
-              />
-            </Field>
-            <Field label="Kanten" value={`${params.edgeThreshold}`}>
-              <Slider
-                min={8}
-                max={48}
-                step={1}
-                value={[params.edgeThreshold]}
-                onValueChange={(v) =>
-                  applyParams({ edgeThreshold: v[0] ?? 20 })
-                }
-              />
-            </Field>
-            <Field label="Tusche" value={`${params.inkThreshold}`}>
-              <Slider
-                min={8}
-                max={90}
-                step={1}
-                value={[params.inkThreshold]}
-                onValueChange={(v) =>
-                  applyParams({ inkThreshold: v[0] ?? 44 })
-                }
-              />
-            </Field>
-            <Field label="Feinstriche" value={`${params.minStroke} px`}>
-              <Slider
-                min={1}
-                max={14}
-                step={1}
-                value={[params.minStroke]}
-                onValueChange={(v) =>
-                  applyParams({ minStroke: v[0] ?? 3 })
-                }
-              />
-            </Field>
-            <p className="text-xs leading-normal text-subtle">
-              Kürzere Linien fallen weg. Niedriger = mehr Details, höher =
-              nur die großen Züge.
-            </p>
-            <label className="flex min-h-11 items-center gap-3 text-sm text-fg">
-              <input
-                type="checkbox"
-                checked={params.includeInk}
-                onChange={(e) => applyParams({ includeInk: e.target.checked })}
-                className="size-4 accent-fg"
-              />
-              Dunkle Konturen mitzeichnen
-            </label>
-            <div className="flex flex-col gap-2">
-              <Button
-                type="button"
-                variant={dirty ? "default" : "secondary"}
-                onClick={reprocess}
-                disabled={busy || !dirty}
-              >
-                Änderungen anwenden
-              </Button>
-              <button
-                type="button"
-                onClick={() => {
-                  setParams(DEFAULT_PARAMS);
-                  setTimeline(DEFAULT_TIMELINE);
-                  setLoop(false);
-                }}
-                className="min-h-11 text-xs text-muted transition-colors hover:text-fg"
-              >
-                Standardwerte
-              </button>
+          <div>
+            <div className="flex items-center justify-between gap-2">
+              <Label>Bilder</Label>
+              <span className="text-xs tabular-nums text-subtle">
+                {plates.length}
+              </span>
             </div>
-          </fieldset>
+            <div className="mt-2 grid grid-cols-3 gap-2">
+              {SAMPLES.map((s) => (
+                <button
+                  key={s.id}
+                  type="button"
+                  onClick={() =>
+                    void addSources([{ source: s.src, name: s.label }])
+                  }
+                  className="overflow-hidden rounded-md text-left shadow-border transition-[box-shadow,transform] duration-150 active:scale-[0.96]"
+                >
+                  <img
+                    src={s.src}
+                    alt={s.label}
+                    className="aspect-still w-full object-cover"
+                  />
+                  <span className="block px-2 py-1.5 text-xs font-medium text-fg">
+                    + {s.label}
+                  </span>
+                </button>
+              ))}
+            </div>
+            <ul className="mt-3 flex flex-col gap-1.5">
+              {plates.map((plate, i) => (
+                <li key={plate.id}>
+                  <button
+                    type="button"
+                    onClick={() => setSelectedId(plate.id)}
+                    className={cn(
+                      "flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left shadow-border",
+                      plate.id === selected?.id
+                        ? "bg-raised"
+                        : "hover:bg-raised/60",
+                    )}
+                  >
+                    <img
+                      src={plate.thumb}
+                      alt=""
+                      className="size-8 shrink-0 rounded-sm object-cover"
+                    />
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate text-xs font-medium text-fg">
+                        {i + 1}. {plate.name}
+                      </span>
+                      <span className="block text-xs tabular-nums text-subtle">
+                        Start {formatMs(plate.startMs)}
+                      </span>
+                    </span>
+                    <span className="flex shrink-0 gap-0.5">
+                      <span
+                        role="button"
+                        tabIndex={0}
+                        className="grid size-8 place-items-center text-muted hover:text-fg"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          movePlate(plate.id, -1);
+                        }}
+                      >
+                        <ChevronUp className="size-3.5" />
+                      </span>
+                      <span
+                        role="button"
+                        tabIndex={0}
+                        className="grid size-8 place-items-center text-muted hover:text-fg"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          movePlate(plate.id, 1);
+                        }}
+                      >
+                        <ChevronDown className="size-3.5" />
+                      </span>
+                      <span
+                        role="button"
+                        tabIndex={0}
+                        className="grid size-8 place-items-center text-muted hover:text-danger"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          removePlate(plate.id);
+                        }}
+                      >
+                        <Trash2 className="size-3.5" />
+                      </span>
+                    </span>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </div>
+
+          {selected && (
+            <>
+              <Separator />
+              <fieldset className="flex flex-col gap-4">
+                <legend className="text-xs font-medium tracking-wide text-muted">
+                  {selected.name}
+                </legend>
+                <Field label="Start" value={formatMs(selected.startMs)}>
+                  <Slider
+                    min={0}
+                    max={Math.max(duration + 8000, selected.startMs + 4000)}
+                    step={100}
+                    value={[selected.startMs]}
+                    onValueChange={(v) =>
+                      updatePlate(selected.id, { startMs: v[0] ?? 0 })
+                    }
+                  />
+                </Field>
+                <Field
+                  label="Transparenz"
+                  value={`${Math.round(selected.transparency)}%`}
+                >
+                  <Slider
+                    min={0}
+                    max={100}
+                    step={1}
+                    value={[selected.transparency]}
+                    onValueChange={(v) =>
+                      updatePlate(selected.id, {
+                        transparency: v[0] ?? 100,
+                      })
+                    }
+                  />
+                </Field>
+                <p className="text-xs leading-normal text-subtle">
+                  Papier und helles Grau werden ausgestanzt. Dunkle Striche
+                  bleiben, darunter liegende Bilder scheinen durch.
+                </p>
+                <Field
+                  label="Auflösung"
+                  value={formatSize(selected.params.maxSize)}
+                >
+                  <Slider
+                    min={360}
+                    max={3840}
+                    step={40}
+                    value={[selected.params.maxSize]}
+                    onValueChange={(v) =>
+                      updatePlate(selected.id, {
+                        params: {
+                          ...selected.params,
+                          maxSize: v[0] ?? 680,
+                        },
+                      })
+                    }
+                  />
+                </Field>
+                <div className="flex flex-wrap gap-1.5">
+                  {SIZE_PRESETS.map((p) => (
+                    <button
+                      key={p.size}
+                      type="button"
+                      onClick={() =>
+                        updatePlate(selected.id, {
+                          params: { ...selected.params, maxSize: p.size },
+                        })
+                      }
+                      className={cn(
+                        "h-8 rounded-md px-2.5 text-xs font-medium shadow-border transition-colors",
+                        selected.params.maxSize === p.size
+                          ? "bg-fg text-bg"
+                          : "bg-raised text-muted hover:text-fg",
+                      )}
+                    >
+                      {p.label}
+                    </button>
+                  ))}
+                </div>
+              </fieldset>
+
+              <Separator />
+
+              <fieldset className="flex flex-col gap-4">
+                <legend className="text-xs font-medium tracking-wide text-muted">
+                  Ablauf
+                </legend>
+                <Field
+                  label="Liniendauer"
+                  value={formatMs(selected.timeline.lineMs)}
+                >
+                  <Slider
+                    min={1200}
+                    max={9000}
+                    step={100}
+                    value={[selected.timeline.lineMs]}
+                    onValueChange={(v) =>
+                      updatePlate(selected.id, {
+                        timeline: {
+                          ...selected.timeline,
+                          lineMs: v[0] ?? selected.timeline.lineMs,
+                        },
+                      })
+                    }
+                  />
+                </Field>
+                <Field label="Töne" value={formatMs(selected.timeline.toneMs)}>
+                  <Slider
+                    min={2400}
+                    max={14000}
+                    step={100}
+                    value={[selected.timeline.toneMs]}
+                    onValueChange={(v) =>
+                      updatePlate(selected.id, {
+                        timeline: {
+                          ...selected.timeline,
+                          toneMs: v[0] ?? selected.timeline.toneMs,
+                        },
+                      })
+                    }
+                  />
+                </Field>
+                <Field
+                  label="Halten"
+                  value={formatMs(selected.timeline.holdMs)}
+                >
+                  <Slider
+                    min={400}
+                    max={5000}
+                    step={100}
+                    value={[selected.timeline.holdMs]}
+                    onValueChange={(v) =>
+                      updatePlate(selected.id, {
+                        timeline: {
+                          ...selected.timeline,
+                          holdMs: v[0] ?? selected.timeline.holdMs,
+                        },
+                      })
+                    }
+                  />
+                </Field>
+                <label className="flex min-h-11 items-center gap-3 text-sm text-fg">
+                  <input
+                    type="checkbox"
+                    checked={loop}
+                    onChange={(e) => setLoop(e.target.checked)}
+                    className="size-4 accent-fg"
+                  />
+                  In Schleife abspielen
+                </label>
+              </fieldset>
+
+              <Separator />
+
+              <fieldset className="flex flex-col gap-4">
+                <legend className="text-xs font-medium tracking-wide text-muted">
+                  Erkennung
+                </legend>
+                <Field
+                  label="Tonstufen"
+                  value={String(selected.params.levels)}
+                >
+                  <Slider
+                    min={4}
+                    max={16}
+                    step={1}
+                    value={[selected.params.levels]}
+                    onValueChange={(v) =>
+                      updatePlate(selected.id, {
+                        params: {
+                          ...selected.params,
+                          levels: v[0] ?? 10,
+                        },
+                      })
+                    }
+                  />
+                </Field>
+                <Field
+                  label="Kanten"
+                  value={`${selected.params.edgeThreshold}`}
+                >
+                  <Slider
+                    min={8}
+                    max={48}
+                    step={1}
+                    value={[selected.params.edgeThreshold]}
+                    onValueChange={(v) =>
+                      updatePlate(selected.id, {
+                        params: {
+                          ...selected.params,
+                          edgeThreshold: v[0] ?? 20,
+                        },
+                      })
+                    }
+                  />
+                </Field>
+                <Field
+                  label="Tusche"
+                  value={`${selected.params.inkThreshold}`}
+                >
+                  <Slider
+                    min={8}
+                    max={90}
+                    step={1}
+                    value={[selected.params.inkThreshold]}
+                    onValueChange={(v) =>
+                      updatePlate(selected.id, {
+                        params: {
+                          ...selected.params,
+                          inkThreshold: v[0] ?? 44,
+                        },
+                      })
+                    }
+                  />
+                </Field>
+                <Field
+                  label="Feinstriche"
+                  value={`${selected.params.minStroke} px`}
+                >
+                  <Slider
+                    min={1}
+                    max={14}
+                    step={1}
+                    value={[selected.params.minStroke]}
+                    onValueChange={(v) =>
+                      updatePlate(selected.id, {
+                        params: {
+                          ...selected.params,
+                          minStroke: v[0] ?? 3,
+                        },
+                      })
+                    }
+                  />
+                </Field>
+                <label className="flex min-h-11 items-center gap-3 text-sm text-fg">
+                  <input
+                    type="checkbox"
+                    checked={selected.params.includeInk}
+                    onChange={(e) =>
+                      updatePlate(selected.id, {
+                        params: {
+                          ...selected.params,
+                          includeInk: e.target.checked,
+                        },
+                      })
+                    }
+                    className="size-4 accent-fg"
+                  />
+                  Dunkle Konturen mitzeichnen
+                </label>
+                <div className="flex flex-col gap-2">
+                  <Button
+                    type="button"
+                    variant={dirty ? "default" : "secondary"}
+                    onClick={() => void reprocessSelected()}
+                    disabled={busy || !dirty}
+                  >
+                    Änderungen anwenden
+                  </Button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      updatePlate(selected.id, {
+                        params: { ...DEFAULT_PARAMS },
+                        timeline: { ...DEFAULT_TIMELINE },
+                        transparency: 100,
+                      })
+                    }
+                    className="min-h-11 text-xs text-muted transition-colors hover:text-fg"
+                  >
+                    Standardwerte dieses Bildes
+                  </button>
+                </div>
+              </fieldset>
+            </>
+          )}
         </aside>
       </div>
     </div>

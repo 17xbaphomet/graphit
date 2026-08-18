@@ -1,5 +1,6 @@
-import type { GraphiteJob, Timeline } from "./types";
+import type { Plate, StageSize } from "./types";
 import { GraphiteRenderer, totalDuration } from "./render";
+import { StageRenderer, compositionDuration } from "./compose";
 
 function pickMime(): string {
   const types = [
@@ -15,23 +16,20 @@ function pickMime(): string {
   return "video/webm";
 }
 
-export async function exportWebM(
-  job: GraphiteJob,
-  timeline: Timeline,
+async function recordCanvas(
+  canvas: HTMLCanvasElement,
+  duration: number,
+  pixels: number,
+  draw: (t: number) => void,
   onProgress?: (ratio: number) => void,
 ): Promise<Blob> {
   if (typeof MediaRecorder === "undefined") {
     throw new Error("Videoexport wird von diesem Browser nicht unterstützt");
   }
-
-  const canvas = document.createElement("canvas");
-  const renderer = new GraphiteRenderer(canvas, job, timeline);
   const fps = 30;
-  const duration = totalDuration(job, timeline);
   const frames = Math.max(1, Math.ceil((duration / 1000) * fps));
   const mime = pickMime();
   const stream = canvas.captureStream(fps);
-  const pixels = job.width * job.height;
   const bitrate = Math.min(
     48_000_000,
     Math.max(6_000_000, Math.round(pixels * 2.4)),
@@ -53,7 +51,7 @@ export async function exportWebM(
   recorder.start(200);
   for (let f = 0; f <= frames; f++) {
     const t = (f / frames) * duration;
-    renderer.draw(t);
+    draw(t);
     onProgress?.(f / frames);
     await new Promise<void>((resolve) => {
       requestAnimationFrame(() => resolve());
@@ -68,6 +66,44 @@ export async function exportWebM(
     throw new Error("Die Aufnahme ist leer");
   }
   return new Blob(chunks, { type: mime.split(";")[0] });
+}
+
+export async function exportWebM(
+  job: import("./types").GraphiteJob,
+  timeline: import("./types").Timeline,
+  onProgress?: (ratio: number) => void,
+): Promise<Blob> {
+  const canvas = document.createElement("canvas");
+  const renderer = new GraphiteRenderer(canvas, job, timeline);
+  const duration = totalDuration(job, timeline);
+  return recordCanvas(
+    canvas,
+    duration,
+    job.width * job.height,
+    (t) => {
+      renderer.draw(t);
+    },
+    onProgress,
+  );
+}
+
+export async function exportCompositionWebM(
+  stage: StageSize,
+  plates: Plate[],
+  onProgress?: (ratio: number) => void,
+): Promise<Blob> {
+  const canvas = document.createElement("canvas");
+  const renderer = new StageRenderer(canvas, stage);
+  const duration = compositionDuration(plates);
+  return recordCanvas(
+    canvas,
+    duration,
+    stage.width * stage.height,
+    (t) => {
+      renderer.draw(plates, t, "animation");
+    },
+    onProgress,
+  );
 }
 
 export function downloadBlob(blob: Blob, filename: string) {

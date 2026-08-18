@@ -114,12 +114,38 @@ function writeOriginal(
   dest[p + 3] = 255;
 }
 
-function fillPaper(dest: Uint8ClampedArray, paper: GraphiteJob["paper"]) {
+function fillPaper(
+  dest: Uint8ClampedArray,
+  paper: GraphiteJob["paper"],
+  alpha = 1,
+) {
+  const a = Math.round(clamp01(alpha) * 255);
   for (let p = 0; p < dest.length; p += 4) {
     dest[p] = paper[0];
     dest[p + 1] = paper[1];
     dest[p + 2] = paper[2];
-    dest[p + 3] = 255;
+    dest[p + 3] = a;
+  }
+}
+
+/** Fade paper-colored and near-white pixels so overlaps do not cover with white. */
+export function knockPaper(
+  dest: Uint8ClampedArray,
+  _paper: GraphiteJob["paper"],
+  amount: number,
+) {
+  const t = clamp01(amount);
+  if (t <= 0) return;
+  const lo = 255 - 125 * t;
+  const hi = 255 - 8 * t;
+  const span = Math.max(1, hi - lo);
+  for (let p = 0; p < dest.length; p += 4) {
+    const luma =
+      0.2126 * dest[p]! + 0.7152 * dest[p + 1]! + 0.0722 * dest[p + 2]!;
+    let fade = 0;
+    if (luma >= hi) fade = 1;
+    else if (luma > lo) fade = (luma - lo) / span;
+    if (fade > 0) dest[p + 3] = Math.round(dest[p + 3]! * (1 - fade * t));
   }
 }
 
@@ -188,9 +214,10 @@ export function paintFrame(
   job: GraphiteJob,
   timeline: Timeline,
   tMs: number,
+  key = 0,
 ): PhaseInfo {
   const phase = phaseAt(job, timeline, tMs);
-  fillPaper(dest, job.paper);
+  fillPaper(dest, job.paper, 1 - key);
 
   if (phase.kind === "lines") {
     drawLineRange(dest, job, 0, lineCountAt(job, phase));
@@ -201,10 +228,12 @@ export function paintFrame(
 
   if (phase.kind === "hold") {
     dest.set(job.rgba);
+    knockPaper(dest, job.paper, key);
     return phase;
   }
 
   drawToneRange(dest, job, 0, toneCountAt(job, phase));
+  if (key > 0) knockPaper(dest, job.paper, key);
   return phase;
 }
 
@@ -231,9 +260,10 @@ export class GraphiteRenderer {
   timeline: Timeline;
   private lastLine = -1;
   private lastTone = -1;
+  private key = 0;
 
   constructor(canvas: HTMLCanvasElement, job: GraphiteJob, timeline: Timeline) {
-    const ctx = canvas.getContext("2d", { alpha: false });
+    const ctx = canvas.getContext("2d", { alpha: true });
     if (!ctx) throw new Error("Canvas nicht verfügbar");
     this.canvas = canvas;
     this.ctx = ctx;
@@ -242,6 +272,14 @@ export class GraphiteRenderer {
     canvas.width = job.width;
     canvas.height = job.height;
     this.image = ctx.createImageData(job.width, job.height);
+  }
+
+  setKey(amount: number) {
+    const next = clamp01(amount);
+    if (Math.abs(next - this.key) < 0.001) return;
+    this.key = next;
+    this.lastLine = -1;
+    this.lastTone = -1;
   }
 
   attach(job: GraphiteJob, timeline: Timeline) {
@@ -272,7 +310,7 @@ export class GraphiteRenderer {
       !(phase.kind === "hold" && this.lastTone < this.job.toneOrder.length);
 
     if (!canStep) {
-      paintFrame(dest, this.job, this.timeline, tMs);
+      paintFrame(dest, this.job, this.timeline, tMs, this.key);
     } else {
       if (lines > this.lastLine) {
         drawLineRange(dest, this.job, this.lastLine, lines);
@@ -282,6 +320,7 @@ export class GraphiteRenderer {
       }
       if (phase.kind === "hold") {
         dest.set(this.job.rgba);
+        knockPaper(dest, this.job.paper, this.key);
       }
     }
 
@@ -305,7 +344,7 @@ export class GraphiteRenderer {
   drawLinesOnly() {
     this.lastLine = -1;
     this.lastTone = -1;
-    fillPaper(this.image.data, this.job.paper);
+    fillPaper(this.image.data, this.job.paper, 1 - this.key);
     drawLines(this.image.data, this.job, this.job.lineOrder.length);
     this.ctx.putImageData(this.image, 0, 0);
   }
@@ -314,6 +353,7 @@ export class GraphiteRenderer {
     this.lastLine = -1;
     this.lastTone = -1;
     this.image.data.set(this.job.rgba);
+    knockPaper(this.image.data, this.job.paper, this.key);
     this.ctx.putImageData(this.image, 0, 0);
   }
 }
