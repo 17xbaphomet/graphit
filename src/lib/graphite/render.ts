@@ -1,4 +1,5 @@
 import type { GraphiteJob, PhaseInfo, Timeline } from "./types";
+import { LINE_MARK_MAX } from "./types";
 
 function clamp01(x: number) {
   return x < 0 ? 0 : x > 1 ? 1 : x;
@@ -79,29 +80,6 @@ export function phaseAt(
   };
 }
 
-function writePixel(
-  dest: Uint8ClampedArray,
-  i: number,
-  r: number,
-  g: number,
-  b: number,
-  a = 255,
-) {
-  const p = i * 4;
-  if (a >= 255) {
-    dest[p] = r;
-    dest[p + 1] = g;
-    dest[p + 2] = b;
-    dest[p + 3] = 255;
-    return;
-  }
-  const aa = a / 255;
-  dest[p] = dest[p]! * (1 - aa) + r * aa;
-  dest[p + 1] = dest[p + 1]! * (1 - aa) + g * aa;
-  dest[p + 2] = dest[p + 2]! * (1 - aa) + b * aa;
-  dest[p + 3] = 255;
-}
-
 function writeOriginal(
   dest: Uint8ClampedArray,
   src: Uint8ClampedArray,
@@ -112,6 +90,11 @@ function writeOriginal(
   dest[p + 1] = src[p + 1]!;
   dest[p + 2] = src[p + 2]!;
   dest[p + 3] = 255;
+}
+
+/** Skip paper-bright pixels so line strokes stay visually connected. */
+function isLineMark(job: GraphiteJob, i: number) {
+  return job.gray[i]! <= LINE_MARK_MAX;
 }
 
 function fillPaper(
@@ -154,10 +137,11 @@ function drawLines(
   job: GraphiteJob,
   count: number,
 ) {
-  const ink = job.ink;
   const n = Math.min(count, job.lineOrder.length);
+  const src = job.rgba;
   for (let k = 0; k < n; k++) {
-    writePixel(dest, job.lineOrder[k]!, ink[0], ink[1], ink[2]);
+    const i = job.lineOrder[k]!;
+    if (isLineMark(job, i)) writeOriginal(dest, src, i);
   }
 }
 
@@ -173,11 +157,12 @@ function drawLineRange(
   from: number,
   to: number,
 ) {
-  const ink = job.ink;
+  const src = job.rgba;
   const a = Math.max(0, from);
   const b = Math.min(job.lineOrder.length, to);
   for (let k = a; k < b; k++) {
-    writePixel(dest, job.lineOrder[k]!, ink[0], ink[1], ink[2]);
+    const i = job.lineOrder[k]!;
+    if (isLineMark(job, i)) writeOriginal(dest, src, i);
   }
 }
 

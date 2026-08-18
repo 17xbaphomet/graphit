@@ -1,5 +1,5 @@
 import type { AnalyzeParams, GraphiteJob, ToneLayer } from "./types";
-import { DEFAULT_PARAMS } from "./types";
+import { DEFAULT_PARAMS, LINE_MARK_MAX } from "./types";
 
 const DX = [-1, 0, 1, -1, 1, -1, 0, 1] as const;
 const DY = [-1, -1, -1, 0, 0, 1, 1, 1] as const;
@@ -104,6 +104,145 @@ function peakMagnitude(mag: Float32Array): number {
     if (v > max) max = v;
   }
   return max;
+}
+
+function nonMaxEdge(
+  gray: Uint8Array,
+  mag: Float32Array,
+  w: number,
+  h: number,
+  cut: number,
+): Uint8Array {
+  const out = new Uint8Array(w * h);
+  for (let y = 1; y < h - 1; y++) {
+    const row = y * w;
+    const up = row - w;
+    const down = row + w;
+    for (let x = 1; x < w - 1; x++) {
+      const i = row + x;
+      const m = mag[i]!;
+      if (m < cut) continue;
+      const a = gray[up + x - 1]!;
+      const b = gray[up + x]!;
+      const c = gray[up + x + 1]!;
+      const d = gray[row + x - 1]!;
+      const f = gray[row + x + 1]!;
+      const g = gray[down + x - 1]!;
+      const hv = gray[down + x]!;
+      const j = gray[down + x + 1]!;
+      const gx = -a + c - 2 * d + 2 * f - g + j;
+      const gy = -a - 2 * b - c + g + 2 * hv + j;
+      const ax = Math.abs(gx);
+      const ay = Math.abs(gy);
+      let n1: number;
+      let n2: number;
+      if (ax > ay * 2) {
+        n1 = mag[row + x - 1]!;
+        n2 = mag[row + x + 1]!;
+      } else if (ay > ax * 2) {
+        n1 = mag[up + x]!;
+        n2 = mag[down + x]!;
+      } else if (gx * gy > 0) {
+        n1 = mag[up + x - 1]!;
+        n2 = mag[down + x + 1]!;
+      } else {
+        n1 = mag[up + x + 1]!;
+        n2 = mag[down + x - 1]!;
+      }
+      if (m >= n1 && m >= n2) out[i] = 1;
+    }
+  }
+  return out;
+}
+
+const RING: readonly [number, number][] = [
+  [0, -1],
+  [1, -1],
+  [1, 0],
+  [1, 1],
+  [0, 1],
+  [-1, 1],
+  [-1, 0],
+  [-1, -1],
+];
+
+/** Zhang–Suen: fat edge blobs become 1px ridges. */
+function thinMask(mask: Uint8Array, w: number, h: number): Uint8Array {
+  const img = new Uint8Array(mask);
+  let changed = true;
+  for (let pass = 0; pass < 48 && changed; pass++) {
+    changed = false;
+    for (let step = 0; step < 2; step++) {
+      const kill: number[] = [];
+      for (let y = 1; y < h - 1; y++) {
+        for (let x = 1; x < w - 1; x++) {
+          const i = y * w + x;
+          if (!img[i]) continue;
+          const p = new Uint8Array(8);
+          let black = 0;
+          for (let k = 0; k < 8; k++) {
+            const [dx, dy] = RING[k]!;
+            const v = img[(y + dy) * w + (x + dx)] ? 1 : 0;
+            p[k] = v;
+            black += v;
+          }
+          if (black < 2 || black > 6) continue;
+          let trans = 0;
+          for (let k = 0; k < 8; k++) {
+            if (p[k] === 0 && p[(k + 1) & 7] === 1) trans++;
+          }
+          if (trans !== 1) continue;
+          if (step === 0) {
+            if (p[0]! * p[2]! * p[4]!) continue;
+            if (p[2]! * p[4]! * p[6]!) continue;
+          } else {
+            if (p[0]! * p[2]! * p[6]!) continue;
+            if (p[0]! * p[4]! * p[6]!) continue;
+          }
+          kill.push(i);
+        }
+      }
+      if (kill.length > 0) {
+        changed = true;
+        for (const i of kill) img[i] = 0;
+      }
+    }
+  }
+  return img;
+}
+
+/** Move pale ridge pixels onto the darker side of the edge. */
+function snapMaskToDark(
+  mask: Uint8Array,
+  gray: Uint8Array,
+  w: number,
+  h: number,
+  pale: number,
+): Uint8Array {
+  const out = new Uint8Array(mask.length);
+  for (let i = 0; i < mask.length; i++) {
+    if (!mask[i]) continue;
+    if (gray[i]! <= pale) {
+      out[i] = 1;
+      continue;
+    }
+    const x = i % w;
+    const y = (i / w) | 0;
+    let best = i;
+    let bestG = gray[i]!;
+    for (let d = 0; d < 8; d++) {
+      const xx = x + DX[d]!;
+      const yy = y + DY[d]!;
+      if (xx < 0 || xx >= w || yy < 0 || yy >= h) continue;
+      const j = yy * w + xx;
+      if (gray[j]! < bestG) {
+        bestG = gray[j]!;
+        best = j;
+      }
+    }
+    if (bestG < gray[i]!) out[best] = 1;
+  }
+  return out;
 }
 
 function isDarkContour(
@@ -398,6 +537,261 @@ function flattenStrokes(
   return o === order.length ? order : order.subarray(0, o);
 }
 
+function labelComponents(mask: Uint8Array, w: number, h: number): Int32Array {
+  const labels = new Int32Array(mask.length);
+  labels.fill(-1);
+  let id = 0;
+  const stack: number[] = [];
+  for (let seed = 0; seed < mask.length; seed++) {
+    if (!mask[seed] || labels[seed] >= 0) continue;
+    stack.push(seed);
+    labels[seed] = id;
+    while (stack.length > 0) {
+      const cur = stack.pop()!;
+      const x = cur % w;
+      const y = (cur / w) | 0;
+      for (let d = 0; d < 8; d++) {
+        const xx = x + DX[d]!;
+        const yy = y + DY[d]!;
+        if (xx < 0 || xx >= w || yy < 0 || yy >= h) continue;
+        const j = yy * w + xx;
+        if (!mask[j] || labels[j] >= 0) continue;
+        labels[j] = id;
+        stack.push(j);
+      }
+    }
+    id++;
+  }
+  return labels;
+}
+
+function groupMinDist(
+  strokes: number[][],
+  w: number,
+  px: number,
+  py: number,
+): number {
+  let best = 1e15;
+  for (const s of strokes) {
+    const a = s[0]!;
+    const b = s[s.length - 1]!;
+    const ax = a % w;
+    const ay = (a / w) | 0;
+    const bx = b % w;
+    const by = (b / w) | 0;
+    const da = (ax - px) * (ax - px) + (ay - py) * (ay - py);
+    const db = (bx - px) * (bx - px) + (by - py) * (by - py);
+    if (da < best) best = da;
+    if (db < best) best = db;
+  }
+  return best;
+}
+
+/** Finish every 8-connected line network before jumping to the next. */
+function flattenConnected(
+  strokes: number[][],
+  mask: Uint8Array,
+  w: number,
+  h: number,
+  opts: TourOpts = {},
+): Uint32Array {
+  const minLen = opts.minLen ?? 3;
+  if (strokes.length === 0) return new Uint32Array(0);
+
+  const labels = labelComponents(mask, w, h);
+  const groups = new Map<number, number[][]>();
+  for (const stroke of strokes) {
+    const lab = labels[stroke[0]!] ?? -1;
+    const list = groups.get(lab);
+    if (list) list.push(stroke);
+    else groups.set(lab, [stroke]);
+  }
+
+  const ranked = [...groups.values()]
+    .map((g) => {
+      let len = 0;
+      for (const s of g) len += s.length;
+      return { g, len };
+    })
+    .filter((x) => x.len >= minLen)
+    .sort((a, b) => b.len - a.len)
+    .map((x) => x.g);
+
+  if (ranked.length === 0) return new Uint32Array(0);
+
+  const used = new Uint8Array(ranked.length);
+  const parts: Uint32Array[] = [];
+  let sx = opts.startX;
+  let sy = opts.startY;
+  let total = 0;
+
+  for (let n = 0; n < ranked.length; n++) {
+    let pick = -1;
+    if (n === 0 && sx === undefined) {
+      pick = 0;
+    } else {
+      const px = sx ?? 0;
+      const py = sy ?? 0;
+      let bestD = 1e15;
+      for (let i = 0; i < ranked.length; i++) {
+        if (used[i]) continue;
+        const d = groupMinDist(ranked[i]!, w, px, py);
+        if (d < bestD) {
+          bestD = d;
+          pick = i;
+        }
+      }
+    }
+    if (pick < 0) break;
+    used[pick] = 1;
+    const part = flattenStrokes(ranked[pick]!, w, {
+      minLen: 1,
+      startX: sx,
+      startY: sy,
+    });
+    parts.push(part);
+    total += part.length;
+    if (part.length > 0) {
+      const last = part[part.length - 1]!;
+      sx = last % w;
+      sy = (last / w) | 0;
+    }
+  }
+
+  const order = new Uint32Array(total);
+  let o = 0;
+  for (const part of parts) {
+    order.set(part, o);
+    o += part.length;
+  }
+  return order;
+}
+
+function dilateDark(
+  mask: Uint8Array,
+  gray: Uint8Array,
+  w: number,
+  h: number,
+  radius: number,
+  darkMax: number,
+): Uint8Array {
+  const out = new Uint8Array(mask);
+  const r2 = radius * radius;
+  for (let i = 0; i < mask.length; i++) {
+    if (!mask[i]) continue;
+    const x = i % w;
+    const y = (i / w) | 0;
+    for (let dy = -radius; dy <= radius; dy++) {
+      const yy = y + dy;
+      if (yy < 0 || yy >= h) continue;
+      for (let dx = -radius; dx <= radius; dx++) {
+        if (dx * dx + dy * dy > r2) continue;
+        const xx = x + dx;
+        if (xx < 0 || xx >= w) continue;
+        const j = yy * w + xx;
+        if (gray[j]! <= darkMax) out[j] = 1;
+      }
+    }
+  }
+  return out;
+}
+
+function bridgeDark(
+  mask: Uint8Array,
+  gray: Uint8Array,
+  w: number,
+  h: number,
+  gap: number,
+  darkMax: number,
+): Uint8Array {
+  const out = new Uint8Array(mask);
+  for (let i = 0; i < mask.length; i++) {
+    if (!mask[i]) continue;
+    const x = i % w;
+    const y = (i / w) | 0;
+    for (let dy = -gap; dy <= gap; dy++) {
+      for (let dx = -gap; dx <= gap; dx++) {
+        if (Math.abs(dx) <= 1 && Math.abs(dy) <= 1) continue;
+        const xx = x + dx;
+        const yy = y + dy;
+        if (xx < 0 || yy < 0 || xx >= w || yy >= h) continue;
+        if (!mask[yy * w + xx]) continue;
+        const steps = Math.max(Math.abs(dx), Math.abs(dy));
+        let ok = true;
+        for (let s = 1; s < steps; s++) {
+          const px = x + Math.round((dx * s) / steps);
+          const py = y + Math.round((dy * s) / steps);
+          if (gray[py * w + px]! > darkMax) {
+            ok = false;
+            break;
+          }
+        }
+        if (!ok) continue;
+        for (let s = 1; s < steps; s++) {
+          const px = x + Math.round((dx * s) / steps);
+          const py = y + Math.round((dy * s) / steps);
+          out[py * w + px] = 1;
+        }
+      }
+    }
+  }
+  return out;
+}
+
+/** Paint the dark body of a line as the centerline is walked. */
+function expandLineBody(
+  order: Uint32Array,
+  gray: Uint8Array,
+  w: number,
+  h: number,
+  radius: number,
+  darkMax: number,
+): Uint32Array {
+  if (order.length === 0) return order;
+  const used = new Uint8Array(gray.length);
+  const cap = order.length * (2 * radius + 1) * (2 * radius + 1);
+  const out = new Uint32Array(cap);
+  let o = 0;
+  const r2 = radius * radius;
+  const js: number[] = [];
+  const ds: number[] = [];
+  for (let k = 0; k < order.length; k++) {
+    const i = order[k]!;
+    const x = i % w;
+    const y = (i / w) | 0;
+    js.length = 0;
+    ds.length = 0;
+    for (let dy = -radius; dy <= radius; dy++) {
+      const yy = y + dy;
+      if (yy < 0 || yy >= h) continue;
+      for (let dx = -radius; dx <= radius; dx++) {
+        if (dx * dx + dy * dy > r2) continue;
+        const xx = x + dx;
+        if (xx < 0 || xx >= w) continue;
+        const j = yy * w + xx;
+        if (used[j] || gray[j]! > darkMax) continue;
+        used[j] = 1;
+        js.push(j);
+        ds.push(dx * dx + dy * dy);
+      }
+    }
+    for (let a = 1; a < js.length; a++) {
+      const jv = js[a]!;
+      const dv = ds[a]!;
+      let b = a;
+      while (b > 0 && ds[b - 1]! > dv) {
+        js[b] = js[b - 1]!;
+        ds[b] = ds[b - 1]!;
+        b--;
+      }
+      js[b] = jv;
+      ds[b] = dv;
+    }
+    for (let a = 0; a < js.length; a++) out[o++] = js[a]!;
+  }
+  return out.subarray(0, o);
+}
+
 function orderMask(
   mask: Uint8Array,
   w: number,
@@ -479,20 +873,45 @@ export function analyzeRaster(
   const gray = toGray(rgba, count);
   const blurred = boxBlur3(gray, width, height);
   const mag = sobelMag(blurred, width, height);
-  const rawMask = new Uint8Array(count);
   const cut = (params.edgeThreshold / 100) * peakMagnitude(mag);
   const inkCut = params.includeInk ? params.inkThreshold : -1;
+  const ridge = nonMaxEdge(blurred, mag, width, height, cut);
+  const rawMask = new Uint8Array(count);
   for (let i = 0; i < count; i++) {
-    const edge = mag[i]! >= cut;
+    const edge = ridge[i] === 1;
     const ink = inkCut >= 0 && isDarkContour(gray, i, width, height, inkCut);
     if (edge || ink) rawMask[i] = 1;
   }
-  const mask = pruneIsolatedAt(rawMask, width, height);
-
-  const strokes = traceStrokes(mask, width, height);
-  const lineOrder = flattenStrokes(strokes, width, {
+  const skeleton = thinMask(
+    snapMaskToDark(
+      thinMask(pruneIsolatedAt(rawMask, width, height), width, height),
+      gray,
+      width,
+      height,
+      132,
+    ),
+    width,
+    height,
+  );
+  const bridged = thinMask(
+    bridgeDark(skeleton, gray, width, height, 2, LINE_MARK_MAX),
+    width,
+    height,
+  );
+  const cluster = dilateDark(bridged, gray, width, height, 2, LINE_MARK_MAX);
+  const strokes = traceStrokes(bridged, width, height);
+  const spine = flattenConnected(strokes, cluster, width, height, {
     minLen: Math.max(1, params.minStroke),
   });
+  const radius = Math.max(2, Math.min(4, Math.round(Math.max(width, height) / 420)));
+  const lineOrder = expandLineBody(
+    spine,
+    gray,
+    width,
+    height,
+    radius,
+    LINE_MARK_MAX,
+  );
   let sx: number | undefined;
   let sy: number | undefined;
   if (lineOrder.length > 0) {

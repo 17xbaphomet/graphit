@@ -104,6 +104,9 @@ export const DEFAULT_PARAMS: AnalyzeParams = {
   levels: 10,
 };
 
+/** Pixels brighter than this are not painted in the line phase. */
+export const LINE_MARK_MAX = 158;
+
 export const DEFAULT_TIMELINE: Timeline = {
   lineMs: 4800,
   toneMs: 7200,
