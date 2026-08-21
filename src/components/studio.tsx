@@ -1,14 +1,17 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   ChevronDown,
   ChevronUp,
   Download,
   ImagePlus,
+  ListPlus,
+  ListStart,
   LoaderCircle,
   Pause,
   PenLine,
   Play,
   RotateCcw,
+  Square,
   Trash2,
 } from "lucide-react";
 import { toast } from "sonner";
@@ -27,15 +30,22 @@ import {
   suggestFrame,
 } from "@/lib/graphite/compose";
 import { downloadBlob, exportCompositionWebM, exportDurationMs } from "@/lib/graphite/export";
+import { applyOverride, resolvePlates, resolvedParams, sameParams } from "@/lib/graphite/master";
+import { fileSlug, queueItemDuration, snapshotComposition } from "@/lib/graphite/queue";
 import {
+  DEFAULT_EXPORT_MASTER,
+  DEFAULT_OVERRIDES,
   DEFAULT_PARAMS,
   DEFAULT_STAGE,
   DEFAULT_TIMELINE,
   STAGE_PRESETS,
   type AnalyzeParams,
+  type ExportMaster,
   type FrameRect,
+  type MasterableKey,
   type PhaseInfo,
   type Plate,
+  type RenderQueueItem,
   type StageSize,
   type Timeline,
 } from "@/lib/graphite/types";
@@ -50,7 +60,8 @@ const SAMPLES = [
 type ViewMode = "animation" | "lines" | "original";
 
 function formatMs(ms: number) {
-  return `${(ms / 1000).toFixed(1)} s`;
+  const n = Number.isFinite(ms) ? ms : 0;
+  return `${(n / 1000).toFixed(1)} s`;
 }
 
 function formatSize(px: number) {
@@ -96,6 +107,7 @@ function makePlate(
     applied: { ...DEFAULT_PARAMS },
     job: null,
     transparency: 100,
+    overrides: { ...DEFAULT_OVERRIDES },
     ...extras,
   };
 }
@@ -107,7 +119,11 @@ export function Studio() {
   const clockRef = useRef({ playing: false, origin: 0, t: 0 });
   const fileRef = useRef<HTMLInputElement>(null);
   const platesRef = useRef<Plate[]>([]);
+  const resolvedRef = useRef<Plate[]>([]);
   const genRef = useRef(0);
+  const queueRef = useRef<RenderQueueItem[]>([]);
+  const queueRunRef = useRef(false);
+  const queueCancelRef = useRef(false);
 
   const [plates, setPlates] = useState<Plate[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -122,21 +138,27 @@ export function Studio() {
   const [view, setView] = useState<ViewMode>("animation");
   const [error, setError] = useState<string | null>(null);
   const [loop, setLoop] = useState(false);
+  const [master, setMaster] = useState<ExportMaster>(DEFAULT_EXPORT_MASTER);
+  const [queue, setQueue] = useState<RenderQueueItem[]>([]);
+  const [queueLabel, setQueueLabel] = useState("");
+  const [queueRunning, setQueueRunning] = useState(false);
 
+  const resolved = useMemo(() => resolvePlates(plates, master), [plates, master]);
   platesRef.current = plates;
+  resolvedRef.current = resolved;
+  queueRef.current = queue;
   const selected = plates.find((p) => p.id === selectedId) ?? plates[0] ?? null;
-  const duration = compositionDuration(plates);
-  const ready = plates.some((p) => p.job);
-  const dirty = selected
-    ? selected.params.maxSize !== selected.applied.maxSize ||
-      selected.params.edgeThreshold !== selected.applied.edgeThreshold ||
-      selected.params.inkThreshold !== selected.applied.inkThreshold ||
-      selected.params.includeInk !== selected.applied.includeInk ||
-      selected.params.minStroke !== selected.applied.minStroke ||
-      selected.params.levels !== selected.applied.levels
-    : false;
+  const shown = selected
+    ? (resolved.find((p) => p.id === selected.id) ?? selected)
+    : null;
+  const duration = compositionDuration(resolved);
+  const ready = resolved.some((p) => p.job);
+  const activeJob =
+    queue.find((q) => q.status === "preparing" || q.status === "rendering") ??
+    null;
+  const queuedCount = queue.filter((q) => q.status === "queued").length;
 
-  const paint = useCallback((ms: number, mode: ViewMode, list = platesRef.current) => {
+  const paint = useCallback((ms: number, mode: ViewMode, list = resolvedRef.current) => {
     const renderer = stageRef.current;
     if (!renderer) return;
     setPhase(renderer.draw(list, ms, mode));
@@ -153,13 +175,14 @@ export function Studio() {
   }, [stage]);
 
   const analyzePlate = useCallback(async (plate: Plate) => {
-    const job = await analyzeSource(plate.source, plate.params);
+    const params = resolvedParams(plate, master);
+    const job = await analyzeSource(plate.source, params);
     return {
       ...plate,
       job,
-      applied: { ...plate.params },
-    } satisfies Plate;
-  }, []);
+      applied: { ...params },
+    };
+  }, [master]);
 
   const addSources = useCallback(
     async (sources: { source: File | string; name?: string }[]) => {
@@ -198,7 +221,7 @@ export function Studio() {
         clockRef.current.t = 0;
         setTMs(0);
         setView("animation");
-        paint(0, "animation", working);
+        paint(0, "animation", resolvePlates(working, master));
         return true;
       } catch (err) {
         created.forEach((p) => {
@@ -213,8 +236,62 @@ export function Studio() {
         setBusy(false);
       }
     },
-    [analyzePlate, ensureStage, paint],
+    [analyzePlate, ensureStage, master, paint],
   );
+
+  useEffect(() => {
+    if (busy || exporting) return;
+    const stale = plates.filter(
+      (p) => !p.job || !sameParams(resolvedParams(p, master), p.applied),
+    );
+    if (stale.length === 0) return;
+    const timer = window.setTimeout(() => {
+      void (async () => {
+        const gen = ++genRef.current;
+        setBusy(true);
+        setPlaying(false);
+        try {
+          let working = [...platesRef.current];
+          const ids = new Set(
+            working
+              .filter(
+                (p) =>
+                  !p.job || !sameParams(resolvedParams(p, master), p.applied),
+              )
+              .map((p) => p.id),
+          );
+          const queue = working.filter((p) => ids.has(p.id));
+          for (let i = 0; i < queue.length; i++) {
+            setBusyLabel(
+              queue.length > 1
+                ? `Bild ${i + 1}/${queue.length} wird gelesen`
+                : "Bild wird gelesen",
+            );
+            const plate = working.find((p) => p.id === queue[i]!.id);
+            if (!plate) continue;
+            const done = await analyzePlate(plate);
+            if (gen !== genRef.current) return;
+            working = working.map((p) => (p.id === done.id ? done : p));
+          }
+          if (gen !== genRef.current) return;
+          platesRef.current = working;
+          setPlates(working);
+          paint(
+            clockRef.current.t,
+            view,
+            resolvePlates(working, master),
+          );
+        } catch (err) {
+          toast.error(
+            err instanceof Error ? err.message : "Analyse fehlgeschlagen",
+          );
+        } finally {
+          if (gen === genRef.current) setBusy(false);
+        }
+      })();
+    }, 420);
+    return () => window.clearTimeout(timer);
+  }, [analyzePlate, busy, exporting, master, paint, plates, view]);
 
   useEffect(() => {
     void addSources([{ source: SAMPLES[0].src, name: SAMPLES[0].label }]).then(
@@ -229,7 +306,7 @@ export function Studio() {
   useEffect(() => {
     ensureStage();
     paint(clockRef.current.t, view);
-  }, [ensureStage, paint, plates, stage, view]);
+  }, [ensureStage, master, paint, plates, stage, view]);
 
   useEffect(() => {
     if (!playing || !ready || view !== "animation") return;
@@ -240,7 +317,7 @@ export function Studio() {
     const tick = (now: number) => {
       if (!clockRef.current.playing) return;
       const t = now - clockRef.current.origin;
-      const cap = compositionDuration(platesRef.current);
+      const cap = compositionDuration(resolvedRef.current);
       if (t >= cap) {
         if (loop) {
           clockRef.current.origin = now;
@@ -279,7 +356,7 @@ export function Studio() {
       e.preventDefault();
       if (!ready || busy || exporting) return;
       setView("animation");
-      if (clockRef.current.t >= compositionDuration(platesRef.current) - 16) {
+      if (clockRef.current.t >= compositionDuration(resolvedRef.current) - 16) {
         clockRef.current.t = 0;
         setTMs(0);
       }
@@ -304,23 +381,6 @@ export function Studio() {
     );
   };
 
-  const reprocessSelected = async () => {
-    if (!selected) return;
-    setBusy(true);
-    setBusyLabel("Bild wird gelesen");
-    setPlaying(false);
-    try {
-      const next = await analyzePlate(selected);
-      setPlates((list) => list.map((p) => (p.id === selected.id ? next : p)));
-      paint(clockRef.current.t, view);
-      setPlaying(true);
-    } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Analyse fehlgeschlagen");
-    } finally {
-      setBusy(false);
-    }
-  };
-
   const removePlate = (id: string) => {
     setPlates((list) => {
       const gone = list.find((p) => p.id === id);
@@ -338,10 +398,62 @@ export function Studio() {
       const j = i + dir;
       if (i < 0 || j < 0 || j >= list.length) return list;
       const copy = [...list];
-      const [item] = copy.splice(i, 1);
-      copy.splice(j, 0, item!);
+      const a = copy[i]!;
+      const b = copy[j]!;
+      copy[i] = { ...b, startMs: a.startMs };
+      copy[j] = { ...a, startMs: b.startMs };
       return copy;
     });
+  };
+
+  const setPlateOverride = (key: MasterableKey, on: boolean) => {
+    if (!selected) return;
+    updatePlate(selected.id, applyOverride(selected, master, key, on));
+  };
+
+  const updateMasterParams = (patch: Partial<AnalyzeParams>) => {
+    setMaster((m) => ({ ...m, params: { ...m.params, ...patch } }));
+  };
+
+  const updateMasterTimeline = (patch: Partial<Timeline>) => {
+    setMaster((m) => ({ ...m, timeline: { ...m.timeline, ...patch } }));
+  };
+
+  const patchQueue = (
+    id: string,
+    patch: Partial<RenderQueueItem>,
+  ) => {
+    setQueue((list) => {
+      const next = list.map((item) =>
+        item.id === id ? { ...item, ...patch } : item,
+      );
+      queueRef.current = next;
+      return next;
+    });
+  };
+
+  const enqueueComposition = () => {
+    if (!ready) return;
+    const item = snapshotComposition(stage, plates, master);
+    setQueue((list) => {
+      const next = [...list, item];
+      queueRef.current = next;
+      return next;
+    });
+    toast.success(`In Queue: ${item.name}`);
+  };
+
+  const preparePlates = async (source: Plate[]) => {
+    const exported: Plate[] = [];
+    for (const plate of source) {
+      if (!plate.job || !sameParams(plate.params, plate.applied)) {
+        const job = await analyzeSource(plate.source, plate.params);
+        exported.push({ ...plate, job, applied: { ...plate.params } });
+      } else {
+        exported.push(plate);
+      }
+    }
+    return exported;
   };
 
   const onExport = async () => {
@@ -349,14 +461,84 @@ export function Studio() {
     setExporting(true);
     setExportRatio(0);
     setPlaying(false);
+    setBusyLabel("Export vorbereiten");
     try {
-      const blob = await exportCompositionWebM(stage, plates, setExportRatio);
+      const exported = await preparePlates(resolvePlates(plates, master));
+      setPlates((list) =>
+        list.map((p) => {
+          const done = exported.find((e) => e.id === p.id);
+          return done ? { ...p, job: done.job, applied: done.applied } : p;
+        }),
+      );
+      const blob = await exportCompositionWebM(stage, exported, setExportRatio);
       downloadBlob(blob, `graphit-${Date.now()}.webm`);
       toast.success("Video gespeichert");
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Export fehlgeschlagen");
     } finally {
       setExporting(false);
+    }
+  };
+
+  const runQueue = async () => {
+    if (queueRunRef.current) return;
+    const pending = queueRef.current.filter((item) => item.status === "queued");
+    if (pending.length === 0) return;
+    queueRunRef.current = true;
+    queueCancelRef.current = false;
+    setQueueRunning(true);
+    setExporting(true);
+    setPlaying(false);
+    try {
+      while (!queueCancelRef.current) {
+        const item = queueRef.current.find((q) => q.status === "queued");
+        if (!item) break;
+        setQueueLabel(item.name);
+        setExportRatio(0);
+        patchQueue(item.id, { status: "preparing", progress: 0, error: undefined });
+        try {
+          const prepared = await preparePlates(item.plates);
+          if (queueCancelRef.current) {
+            patchQueue(item.id, { status: "queued", progress: 0 });
+            break;
+          }
+          patchQueue(item.id, {
+            status: "rendering",
+            plates: prepared,
+            progress: 0,
+          });
+          const blob = await exportCompositionWebM(
+            item.stage,
+            prepared,
+            (ratio) => {
+              setExportRatio(ratio);
+              patchQueue(item.id, { progress: ratio });
+            },
+          );
+          if (queueCancelRef.current) {
+            patchQueue(item.id, { status: "queued", progress: 0 });
+            break;
+          }
+          downloadBlob(
+            blob,
+            `graphit-${fileSlug(item.name)}-${item.id.slice(-5)}.webm`,
+          );
+          patchQueue(item.id, { status: "done", progress: 1 });
+        } catch (err) {
+          const message =
+            err instanceof Error ? err.message : "Export fehlgeschlagen";
+          patchQueue(item.id, { status: "error", error: message });
+          toast.error(`${item.name}: ${message}`);
+        }
+      }
+      const left = queueRef.current.filter((q) => q.status === "queued").length;
+      if (queueCancelRef.current) toast("Queue angehalten");
+      else if (left === 0) toast.success("Queue fertig");
+    } finally {
+      queueRunRef.current = false;
+      setQueueRunning(false);
+      setExporting(false);
+      setQueueLabel("");
     }
   };
 
@@ -376,8 +558,8 @@ export function Studio() {
             Graphit
           </h1>
           <p className="mt-3 max-w-md text-pretty text-sm leading-normal text-muted">
-            Mehrere Bilder auf einer Fläche. Rahmen ziehen und skalieren, Start
-            und alle Zeichenparameter je Bild.
+            Mehrere Bilder auf einer Fläche. Der Export-Master gilt für alle,
+            außer ein Bild überschreibt eine Einstellung mit „Eigen“.
           </p>
         </div>
         <div className="flex items-center gap-3">
@@ -431,7 +613,7 @@ export function Studio() {
                 <div className="flex items-center gap-2 text-sm font-medium">
                   <LoaderCircle className="size-4 animate-spin" />
                   {exporting
-                    ? `Export ${Math.round(exportRatio * 100)}% · ${formatMs(exportDurationMs(duration))}`
+                    ? `${queueLabel ? `Queue · ${queueLabel} · ` : "Export "}${Math.round(exportRatio * 100)}% · ${formatMs(exportDurationMs(activeJob ? queueItemDuration(activeJob) : duration))}`
                     : busyLabel}
                 </div>
               </div>
@@ -477,6 +659,40 @@ export function Studio() {
                 <Download />
                 WebM
               </Button>
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                onClick={enqueueComposition}
+                disabled={!ready || busy}
+              >
+                <ListPlus />
+                In Queue
+              </Button>
+              {queueRunning ? (
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="secondary"
+                  onClick={() => {
+                    queueCancelRef.current = true;
+                  }}
+                >
+                  <Square />
+                  Stop
+                </Button>
+              ) : (
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="secondary"
+                  onClick={() => void runQueue()}
+                  disabled={queuedCount === 0 || exporting}
+                >
+                  <ListStart />
+                  Queue{queuedCount > 0 ? ` ${queuedCount}` : ""}
+                </Button>
+              )}
               <div className="ml-auto flex rounded-md bg-raised p-0.5">
                 {(
                   [
@@ -527,7 +743,7 @@ export function Studio() {
 
             {plates.length > 0 && (
               <TimelineTrack
-                plates={plates}
+                plates={resolved}
                 selectedId={selected?.id ?? null}
                 tMs={tMs}
                 duration={duration}
@@ -542,6 +758,57 @@ export function Studio() {
                   updatePlate(id, { startMs });
                 }}
               />
+            )}
+
+            {queue.length > 0 && (
+              <ul className="flex flex-col gap-1">
+                {queue.map((item, i) => (
+                  <li
+                    key={item.id}
+                    className="flex items-center gap-2 rounded-md bg-raised px-2 py-1.5"
+                  >
+                    <span className="w-5 shrink-0 text-xs tabular-nums text-subtle">
+                      {i + 1}
+                    </span>
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate text-xs font-medium text-fg">
+                        {item.name}
+                      </span>
+                      <span className="block text-xs tabular-nums text-subtle">
+                        {item.stage.width}×{item.stage.height}
+                        {" · "}
+                        {formatMs(queueItemDuration(item))}
+                        {" · "}
+                        {item.status === "queued"
+                          ? "wartet"
+                          : item.status === "preparing"
+                            ? "vorbereiten"
+                            : item.status === "rendering"
+                              ? `${Math.round(item.progress * 100)}%`
+                              : item.status === "done"
+                                ? "fertig"
+                                : item.error ?? "Fehler"}
+                      </span>
+                    </span>
+                    {(item.status === "queued" ||
+                      item.status === "error" ||
+                      item.status === "done") && (
+                      <button
+                        type="button"
+                        className="grid size-8 place-items-center text-muted hover:text-danger"
+                        onClick={() =>
+                          setQueue((list) =>
+                            list.filter((q) => q.id !== item.id),
+                          )
+                        }
+                        aria-label="Aus Queue entfernen"
+                      >
+                        <Trash2 className="size-3.5" />
+                      </button>
+                    )}
+                  </li>
+                ))}
+              </ul>
             )}
 
             <div className="flex items-center justify-between gap-3 text-xs text-muted">
@@ -584,6 +851,176 @@ export function Studio() {
               Ausgabe der Komposition. Rahmen gelten relativ zur Fläche.
             </p>
           </div>
+
+          <Separator />
+
+          <fieldset className="flex flex-col gap-4">
+            <legend className="text-xs font-medium tracking-wide text-muted">
+              Export-Master
+            </legend>
+            <p className="text-xs leading-normal text-subtle">
+              Gilt für alle Bilder. Ein Bild mit „Eigen“ behält seinen eigenen
+              Wert.
+            </p>
+            <Field
+              label="Transparenz"
+              value={`${Math.round(master.transparency)}%`}
+            >
+              <Slider
+                min={0}
+                max={100}
+                step={1}
+                value={[master.transparency]}
+                onValueChange={(v) =>
+                  setMaster((m) => ({ ...m, transparency: v[0] ?? 100 }))
+                }
+              />
+            </Field>
+            <Field label="Auflösung" value={formatSize(master.params.maxSize)}>
+              <Slider
+                min={360}
+                max={3840}
+                step={40}
+                value={[master.params.maxSize]}
+                onValueChange={(v) =>
+                  updateMasterParams({ maxSize: v[0] ?? 680 })
+                }
+              />
+            </Field>
+            <div className="flex flex-wrap gap-1.5">
+              {SIZE_PRESETS.map((p) => (
+                <button
+                  key={p.size}
+                  type="button"
+                  onClick={() => updateMasterParams({ maxSize: p.size })}
+                  className={cn(
+                    "h-8 rounded-md px-2.5 text-xs font-medium shadow-border transition-colors",
+                    master.params.maxSize === p.size
+                      ? "bg-fg text-bg"
+                      : "bg-raised text-muted hover:text-fg",
+                  )}
+                >
+                  {p.label}
+                </button>
+              ))}
+            </div>
+            <Field
+              label="Liniendauer"
+              value={formatMs(master.timeline.lineMs)}
+            >
+              <Slider
+                min={1200}
+                max={9000}
+                step={100}
+                value={[master.timeline.lineMs]}
+                onValueChange={(v) =>
+                  updateMasterTimeline({
+                    lineMs: v[0] ?? master.timeline.lineMs,
+                  })
+                }
+              />
+            </Field>
+            <Field label="Töne" value={formatMs(master.timeline.toneMs)}>
+              <Slider
+                min={2400}
+                max={14000}
+                step={100}
+                value={[master.timeline.toneMs]}
+                onValueChange={(v) =>
+                  updateMasterTimeline({
+                    toneMs: v[0] ?? master.timeline.toneMs,
+                  })
+                }
+              />
+            </Field>
+            <Field label="Halten" value={formatMs(master.timeline.holdMs)}>
+              <Slider
+                min={400}
+                max={5000}
+                step={100}
+                value={[master.timeline.holdMs]}
+                onValueChange={(v) =>
+                  updateMasterTimeline({
+                    holdMs: v[0] ?? master.timeline.holdMs,
+                  })
+                }
+              />
+            </Field>
+            <Field label="Tonstufen" value={String(master.params.levels)}>
+              <Slider
+                min={4}
+                max={16}
+                step={1}
+                value={[master.params.levels]}
+                onValueChange={(v) =>
+                  updateMasterParams({ levels: v[0] ?? 10 })
+                }
+              />
+            </Field>
+            <Field
+              label="Kanten"
+              value={`${master.params.edgeThreshold}`}
+            >
+              <Slider
+                min={8}
+                max={48}
+                step={1}
+                value={[master.params.edgeThreshold]}
+                onValueChange={(v) =>
+                  updateMasterParams({ edgeThreshold: v[0] ?? 20 })
+                }
+              />
+            </Field>
+            <Field label="Tusche" value={`${master.params.inkThreshold}`}>
+              <Slider
+                min={8}
+                max={90}
+                step={1}
+                value={[master.params.inkThreshold]}
+                onValueChange={(v) =>
+                  updateMasterParams({ inkThreshold: v[0] ?? 44 })
+                }
+              />
+            </Field>
+            <Field
+              label="Feinstriche"
+              value={`${master.params.minStroke} px`}
+            >
+              <Slider
+                min={1}
+                max={14}
+                step={1}
+                value={[master.params.minStroke]}
+                onValueChange={(v) =>
+                  updateMasterParams({ minStroke: v[0] ?? 3 })
+                }
+              />
+            </Field>
+            <label className="flex min-h-11 items-center gap-3 text-sm text-fg">
+              <input
+                type="checkbox"
+                checked={master.params.includeInk}
+                onChange={(e) =>
+                  updateMasterParams({ includeInk: e.target.checked })
+                }
+                className="size-4 accent-fg"
+              />
+              Dunkle Konturen mitzeichnen
+            </label>
+            <button
+              type="button"
+              onClick={() =>
+                setMaster({
+                  params: { ...DEFAULT_PARAMS },
+                  timeline: { ...DEFAULT_TIMELINE },
+                  transparency: 100,
+                })
+              }
+              className="min-h-11 text-left text-xs text-muted transition-colors hover:text-fg"
+            >
+              Master zurücksetzen
+            </button>
+          </fieldset>
 
           <Separator />
 
@@ -682,13 +1119,17 @@ export function Studio() {
             </ul>
           </div>
 
-          {selected && (
+          {selected && shown && (
             <>
               <Separator />
               <fieldset className="flex flex-col gap-4">
                 <legend className="text-xs font-medium tracking-wide text-muted">
                   {selected.name}
                 </legend>
+                <p className="text-xs leading-normal text-subtle">
+                  „Eigen“ neben einem Regler überschreibt den Master für dieses
+                  Bild.
+                </p>
                 <Field label="Start" value={formatMs(selected.startMs)}>
                   <Slider
                     min={0}
@@ -702,13 +1143,16 @@ export function Studio() {
                 </Field>
                 <Field
                   label="Transparenz"
-                  value={`${Math.round(selected.transparency)}%`}
+                  value={`${Math.round(shown.transparency)}%`}
+                  override={selected.overrides.transparency}
+                  onOverride={(on) => setPlateOverride("transparency", on)}
                 >
                   <Slider
                     min={0}
                     max={100}
                     step={1}
-                    value={[selected.transparency]}
+                    disabled={!selected.overrides.transparency}
+                    value={[shown.transparency]}
                     onValueChange={(v) =>
                       updatePlate(selected.id, {
                         transparency: v[0] ?? 100,
@@ -722,13 +1166,16 @@ export function Studio() {
                 </p>
                 <Field
                   label="Auflösung"
-                  value={formatSize(selected.params.maxSize)}
+                  value={formatSize(shown.params.maxSize)}
+                  override={selected.overrides.maxSize}
+                  onOverride={(on) => setPlateOverride("maxSize", on)}
                 >
                   <Slider
                     min={360}
                     max={3840}
                     step={40}
-                    value={[selected.params.maxSize]}
+                    disabled={!selected.overrides.maxSize}
+                    value={[shown.params.maxSize]}
                     onValueChange={(v) =>
                       updatePlate(selected.id, {
                         params: {
@@ -744,14 +1191,15 @@ export function Studio() {
                     <button
                       key={p.size}
                       type="button"
+                      disabled={!selected.overrides.maxSize}
                       onClick={() =>
                         updatePlate(selected.id, {
                           params: { ...selected.params, maxSize: p.size },
                         })
                       }
                       className={cn(
-                        "h-8 rounded-md px-2.5 text-xs font-medium shadow-border transition-colors",
-                        selected.params.maxSize === p.size
+                        "h-8 rounded-md px-2.5 text-xs font-medium shadow-border transition-colors disabled:opacity-40",
+                        shown.params.maxSize === p.size
                           ? "bg-fg text-bg"
                           : "bg-raised text-muted hover:text-fg",
                       )}
@@ -770,13 +1218,16 @@ export function Studio() {
                 </legend>
                 <Field
                   label="Liniendauer"
-                  value={formatMs(selected.timeline.lineMs)}
+                  value={formatMs(shown.timeline.lineMs)}
+                  override={selected.overrides.lineMs}
+                  onOverride={(on) => setPlateOverride("lineMs", on)}
                 >
                   <Slider
                     min={1200}
                     max={9000}
                     step={100}
-                    value={[selected.timeline.lineMs]}
+                    disabled={!selected.overrides.lineMs}
+                    value={[shown.timeline.lineMs]}
                     onValueChange={(v) =>
                       updatePlate(selected.id, {
                         timeline: {
@@ -787,12 +1238,18 @@ export function Studio() {
                     }
                   />
                 </Field>
-                <Field label="Töne" value={formatMs(selected.timeline.toneMs)}>
+                <Field
+                  label="Töne"
+                  value={formatMs(shown.timeline.toneMs)}
+                  override={selected.overrides.toneMs}
+                  onOverride={(on) => setPlateOverride("toneMs", on)}
+                >
                   <Slider
                     min={2400}
                     max={14000}
                     step={100}
-                    value={[selected.timeline.toneMs]}
+                    disabled={!selected.overrides.toneMs}
+                    value={[shown.timeline.toneMs]}
                     onValueChange={(v) =>
                       updatePlate(selected.id, {
                         timeline: {
@@ -805,13 +1262,16 @@ export function Studio() {
                 </Field>
                 <Field
                   label="Halten"
-                  value={formatMs(selected.timeline.holdMs)}
+                  value={formatMs(shown.timeline.holdMs)}
+                  override={selected.overrides.holdMs}
+                  onOverride={(on) => setPlateOverride("holdMs", on)}
                 >
                   <Slider
                     min={400}
                     max={5000}
                     step={100}
-                    value={[selected.timeline.holdMs]}
+                    disabled={!selected.overrides.holdMs}
+                    value={[shown.timeline.holdMs]}
                     onValueChange={(v) =>
                       updatePlate(selected.id, {
                         timeline: {
@@ -841,13 +1301,16 @@ export function Studio() {
                 </legend>
                 <Field
                   label="Tonstufen"
-                  value={String(selected.params.levels)}
+                  value={String(shown.params.levels)}
+                  override={selected.overrides.levels}
+                  onOverride={(on) => setPlateOverride("levels", on)}
                 >
                   <Slider
                     min={4}
                     max={16}
                     step={1}
-                    value={[selected.params.levels]}
+                    disabled={!selected.overrides.levels}
+                    value={[shown.params.levels]}
                     onValueChange={(v) =>
                       updatePlate(selected.id, {
                         params: {
@@ -860,13 +1323,16 @@ export function Studio() {
                 </Field>
                 <Field
                   label="Kanten"
-                  value={`${selected.params.edgeThreshold}`}
+                  value={`${shown.params.edgeThreshold}`}
+                  override={selected.overrides.edgeThreshold}
+                  onOverride={(on) => setPlateOverride("edgeThreshold", on)}
                 >
                   <Slider
                     min={8}
                     max={48}
                     step={1}
-                    value={[selected.params.edgeThreshold]}
+                    disabled={!selected.overrides.edgeThreshold}
+                    value={[shown.params.edgeThreshold]}
                     onValueChange={(v) =>
                       updatePlate(selected.id, {
                         params: {
@@ -879,13 +1345,16 @@ export function Studio() {
                 </Field>
                 <Field
                   label="Tusche"
-                  value={`${selected.params.inkThreshold}`}
+                  value={`${shown.params.inkThreshold}`}
+                  override={selected.overrides.inkThreshold}
+                  onOverride={(on) => setPlateOverride("inkThreshold", on)}
                 >
                   <Slider
                     min={8}
                     max={90}
                     step={1}
-                    value={[selected.params.inkThreshold]}
+                    disabled={!selected.overrides.inkThreshold}
+                    value={[shown.params.inkThreshold]}
                     onValueChange={(v) =>
                       updatePlate(selected.id, {
                         params: {
@@ -898,13 +1367,16 @@ export function Studio() {
                 </Field>
                 <Field
                   label="Feinstriche"
-                  value={`${selected.params.minStroke} px`}
+                  value={`${shown.params.minStroke} px`}
+                  override={selected.overrides.minStroke}
+                  onOverride={(on) => setPlateOverride("minStroke", on)}
                 >
                   <Slider
                     min={1}
                     max={14}
                     step={1}
-                    value={[selected.params.minStroke]}
+                    disabled={!selected.overrides.minStroke}
+                    value={[shown.params.minStroke]}
                     onValueChange={(v) =>
                       updatePlate(selected.id, {
                         params: {
@@ -915,31 +1387,43 @@ export function Studio() {
                     }
                   />
                 </Field>
-                <label className="flex min-h-11 items-center gap-3 text-sm text-fg">
-                  <input
-                    type="checkbox"
-                    checked={selected.params.includeInk}
-                    onChange={(e) =>
-                      updatePlate(selected.id, {
-                        params: {
-                          ...selected.params,
-                          includeInk: e.target.checked,
-                        },
-                      })
-                    }
-                    className="size-4 accent-fg"
-                  />
-                  Dunkle Konturen mitzeichnen
-                </label>
-                <div className="flex flex-col gap-2">
-                  <Button
-                    type="button"
-                    variant={dirty ? "default" : "secondary"}
-                    onClick={() => void reprocessSelected()}
-                    disabled={busy || !dirty}
+                <div className="flex min-h-11 items-center justify-between gap-3">
+                  <label className="flex items-center gap-3 text-sm text-fg">
+                    <input
+                      type="checkbox"
+                      checked={shown.params.includeInk}
+                      disabled={!selected.overrides.includeInk}
+                      onChange={(e) =>
+                        updatePlate(selected.id, {
+                          params: {
+                            ...selected.params,
+                            includeInk: e.target.checked,
+                          },
+                        })
+                      }
+                      className="size-4 accent-fg disabled:opacity-40"
+                    />
+                    Dunkle Konturen mitzeichnen
+                  </label>
+                  <label
+                    className="flex shrink-0 items-center gap-1.5 text-xs text-muted"
+                    title="Master überschreiben"
                   >
-                    Änderungen anwenden
-                  </Button>
+                    <input
+                      type="checkbox"
+                      checked={selected.overrides.includeInk}
+                      onChange={(e) =>
+                        setPlateOverride("includeInk", e.target.checked)
+                      }
+                      className="size-3.5 accent-fg"
+                    />
+                    Eigen
+                  </label>
+                </div>
+                <div className="flex flex-col gap-2">
+                  <p className="text-xs leading-normal text-subtle">
+                    Erkennung und Auflösung werden automatisch neu berechnet.
+                  </p>
                   <button
                     type="button"
                     onClick={() =>
@@ -947,6 +1431,7 @@ export function Studio() {
                         params: { ...DEFAULT_PARAMS },
                         timeline: { ...DEFAULT_TIMELINE },
                         transparency: 100,
+                        overrides: { ...DEFAULT_OVERRIDES },
                       })
                     }
                     className="min-h-11 text-xs text-muted transition-colors hover:text-fg"
@@ -967,18 +1452,39 @@ function Field({
   label,
   value,
   children,
+  override,
+  onOverride,
 }: {
   label: string;
   value: string;
   children: ReactNode;
+  override?: boolean;
+  onOverride?: (on: boolean) => void;
 }) {
   return (
     <div className="flex flex-col gap-2">
       <div className="flex items-center justify-between gap-3">
         <Label>{label}</Label>
-        <span className="text-xs tabular-nums text-subtle">{value}</span>
+        <span className="flex items-center gap-2">
+          {onOverride ? (
+            <label
+              className="flex items-center gap-1.5 text-xs text-muted"
+              title="Master überschreiben"
+            >
+              <input
+                type="checkbox"
+                checked={Boolean(override)}
+                onChange={(e) => onOverride(e.target.checked)}
+                className="size-3.5 accent-fg"
+              />
+              Eigen
+            </label>
+          ) : null}
+          <span className="text-xs tabular-nums text-subtle">{value}</span>
+        </span>
       </div>
       {children}
     </div>
   );
 }
+

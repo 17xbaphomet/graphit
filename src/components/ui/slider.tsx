@@ -10,7 +10,7 @@ function Slider({
     <SliderPrimitive.Root
       data-slot="slider"
       className={cn(
-        "relative flex w-full touch-none select-none items-center",
+        "relative flex w-full touch-none select-none items-center data-[disabled]:opacity-40",
         className,
       )}
       {...props}

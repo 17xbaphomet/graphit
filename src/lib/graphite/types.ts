@@ -64,6 +64,46 @@ export type Plate = {
   job: GraphiteJob | null;
   /** 0–100: paper and near-white become see-through so overlaps keep the drawing below. */
   transparency: number;
+  /** Per-setting: when true, this plate keeps its own value instead of the export master. */
+  overrides: PlateOverrides;
+};
+
+export type MasterableKey =
+  | "lineMs"
+  | "toneMs"
+  | "holdMs"
+  | "transparency"
+  | "maxSize"
+  | "levels"
+  | "edgeThreshold"
+  | "inkThreshold"
+  | "minStroke"
+  | "includeInk";
+
+export type PlateOverrides = Record<MasterableKey, boolean>;
+
+export type ExportMaster = {
+  params: AnalyzeParams;
+  timeline: Timeline;
+  transparency: number;
+};
+
+export type RenderQueueStatus =
+  | "queued"
+  | "preparing"
+  | "rendering"
+  | "done"
+  | "error";
+
+export type RenderQueueItem = {
+  id: string;
+  name: string;
+  createdAt: number;
+  stage: StageSize;
+  plates: Plate[];
+  status: RenderQueueStatus;
+  progress: number;
+  error?: string;
 };
 
 export type StageSize = {
@@ -111,4 +151,23 @@ export const DEFAULT_TIMELINE: Timeline = {
   lineMs: 4800,
   toneMs: 7200,
   holdMs: 1600,
+};
+
+export const DEFAULT_OVERRIDES: PlateOverrides = {
+  lineMs: false,
+  toneMs: false,
+  holdMs: false,
+  transparency: false,
+  maxSize: false,
+  levels: false,
+  edgeThreshold: false,
+  inkThreshold: false,
+  minStroke: false,
+  includeInk: false,
+};
+
+export const DEFAULT_EXPORT_MASTER: ExportMaster = {
+  params: { ...DEFAULT_PARAMS },
+  timeline: { ...DEFAULT_TIMELINE },
+  transparency: 100,
 };
