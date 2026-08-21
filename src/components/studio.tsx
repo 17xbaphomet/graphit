@@ -29,8 +29,19 @@ import {
   nextStartMs,
   suggestFrame,
 } from "@/lib/graphite/compose";
-import { downloadBlob, exportCompositionWebM, exportDurationMs } from "@/lib/graphite/export";
+import {
+  downloadBlob,
+  exportCompositionWebM,
+  exportDurationMs,
+  objectUrlFor,
+  pickExportDirectory,
+  saveBlob,
+  writeBlobToDirectory,
+  canUseFolderPicker,
+  canUseSavePicker,
+} from "@/lib/graphite/export";
 import { applyOverride, resolvePlates, resolvedParams, sameParams } from "@/lib/graphite/master";
+import { hardwareLimit, mapLimit } from "@/lib/graphite/pool";
 import { fileSlug, queueItemDuration, snapshotComposition } from "@/lib/graphite/queue";
 import {
   DEFAULT_EXPORT_MASTER,
@@ -142,6 +153,11 @@ export function Studio() {
   const [queue, setQueue] = useState<RenderQueueItem[]>([]);
   const [queueLabel, setQueueLabel] = useState("");
   const [queueRunning, setQueueRunning] = useState(false);
+  const [lastExport, setLastExport] = useState<{
+    url: string;
+    filename: string;
+    blob: Blob;
+  } | null>(null);
 
   const resolved = useMemo(() => resolvePlates(plates, master), [plates, master]);
   platesRef.current = plates;
@@ -165,10 +181,21 @@ export function Studio() {
   }, []);
 
   const ensureStage = useCallback(() => {
-    const canvas = canvasRef.current;
+    let canvas = canvasRef.current;
     if (!canvas) return;
     if (!stageRef.current) {
-      stageRef.current = new StageRenderer(canvas, stage);
+      try {
+        stageRef.current = new StageRenderer(canvas, stage);
+      } catch {
+        const next = document.createElement("canvas");
+        next.className = canvas.className;
+        const label = canvas.getAttribute("aria-label");
+        if (label) next.setAttribute("aria-label", label);
+        canvas.replaceWith(next);
+        canvasRef.current = next;
+        canvas = next;
+        stageRef.current = new StageRenderer(canvas, stage);
+      }
     } else {
       stageRef.current.resize(stage);
     }
@@ -196,23 +223,32 @@ export function Studio() {
       try {
         await new Promise((r) => window.setTimeout(r, 30));
         let working = [...platesRef.current];
+        const pending: Plate[] = [];
         for (let i = 0; i < sources.length; i++) {
-          setBusyLabel(
-            sources.length > 1
-              ? `Bild ${i + 1}/${sources.length} wird gelesen`
-              : "Bild wird gelesen",
-          );
           const plate = makePlate(sources[i]!.source, working, {
-            name: sources[i]!.name ?? sourceName(sources[i]!.source, `Bild ${working.length + 1}`),
+            name:
+              sources[i]!.name ??
+              sourceName(sources[i]!.source, `Bild ${working.length + 1}`),
           });
-          const done = await analyzePlate(plate);
-          if (gen !== genRef.current) {
-            if (done.thumb.startsWith("blob:")) URL.revokeObjectURL(done.thumb);
-            return false;
-          }
-          working = [...working, done];
-          created.push(done);
+          pending.push(plate);
+          working = [...working, plate];
         }
+        setBusyLabel(
+          pending.length > 1
+            ? `${pending.length} Bilder werden gelesen`
+            : "Bild wird gelesen",
+        );
+        const doneList = await mapLimit(pending, hardwareLimit(), (plate) =>
+          analyzePlate(plate),
+        );
+        if (gen !== genRef.current) {
+          doneList.forEach((p) => {
+            if (p.thumb.startsWith("blob:")) URL.revokeObjectURL(p.thumb);
+          });
+          return false;
+        }
+        working = [...platesRef.current, ...doneList];
+        created.push(...doneList);
         if (gen !== genRef.current) return false;
         platesRef.current = working;
         setPlates(working);
@@ -261,18 +297,17 @@ export function Studio() {
               .map((p) => p.id),
           );
           const queue = working.filter((p) => ids.has(p.id));
-          for (let i = 0; i < queue.length; i++) {
-            setBusyLabel(
-              queue.length > 1
-                ? `Bild ${i + 1}/${queue.length} wird gelesen`
-                : "Bild wird gelesen",
-            );
-            const plate = working.find((p) => p.id === queue[i]!.id);
-            if (!plate) continue;
-            const done = await analyzePlate(plate);
-            if (gen !== genRef.current) return;
-            working = working.map((p) => (p.id === done.id ? done : p));
-          }
+          setBusyLabel(
+            queue.length > 1
+              ? `${queue.length} Bilder werden gelesen`
+              : "Bild wird gelesen",
+          );
+          const doneList = await mapLimit(queue, hardwareLimit(), (plate) =>
+            analyzePlate(plate),
+          );
+          if (gen !== genRef.current) return;
+          const byId = new Map(doneList.map((p) => [p.id, p]));
+          working = working.map((p) => byId.get(p.id) ?? p);
           if (gen !== genRef.current) return;
           platesRef.current = working;
           setPlates(working);
@@ -444,16 +479,13 @@ export function Studio() {
   };
 
   const preparePlates = async (source: Plate[]) => {
-    const exported: Plate[] = [];
-    for (const plate of source) {
+    return mapLimit(source, hardwareLimit(), async (plate) => {
       if (!plate.job || !sameParams(plate.params, plate.applied)) {
         const job = await analyzeSource(plate.source, plate.params);
-        exported.push({ ...plate, job, applied: { ...plate.params } });
-      } else {
-        exported.push(plate);
+        return { ...plate, job, applied: { ...plate.params } };
       }
-    }
-    return exported;
+      return plate;
+    });
   };
 
   const onExport = async () => {
@@ -471,8 +503,15 @@ export function Studio() {
         }),
       );
       const blob = await exportCompositionWebM(stage, exported, setExportRatio);
-      downloadBlob(blob, `graphit-${Date.now()}.webm`);
-      toast.success("Video gespeichert");
+      if (!blob || blob.size < 64) throw new Error("Export ist leer");
+      const filename = `graphit-${Date.now()}.webm`;
+      const url = objectUrlFor(blob);
+      setLastExport((prev) => {
+        if (prev?.url) URL.revokeObjectURL(prev.url);
+        return { url, filename, blob };
+      });
+      await saveBlob(blob, filename);
+      toast.success("Video bereit — über den Link speichern");
     } catch (err) {
       toast.error(err instanceof Error ? err.message : "Export fehlgeschlagen");
     } finally {
@@ -484,11 +523,15 @@ export function Studio() {
     if (queueRunRef.current) return;
     const pending = queueRef.current.filter((item) => item.status === "queued");
     if (pending.length === 0) return;
+    const folder = canUseFolderPicker() ? await pickExportDirectory() : null;
     queueRunRef.current = true;
     queueCancelRef.current = false;
     setQueueRunning(true);
     setExporting(true);
     setPlaying(false);
+    if (!folder) {
+      toast("Fertige Videos in der Queue über den Download-Pfeil speichern");
+    }
     try {
       while (!queueCancelRef.current) {
         const item = queueRef.current.find((q) => q.status === "queued");
@@ -519,11 +562,22 @@ export function Studio() {
             patchQueue(item.id, { status: "queued", progress: 0 });
             break;
           }
-          downloadBlob(
+          if (!blob || blob.size < 64) {
+            throw new Error("Export ist leer");
+          }
+          const filename = `graphit-${fileSlug(item.name)}-${item.id.slice(-5)}.webm`;
+          if (item.url) URL.revokeObjectURL(item.url);
+          const url = objectUrlFor(blob);
+          if (folder) {
+            await writeBlobToDirectory(folder, filename, blob);
+          }
+          patchQueue(item.id, {
+            status: "done",
+            progress: 1,
             blob,
-            `graphit-${fileSlug(item.name)}-${item.id.slice(-5)}.webm`,
-          );
-          patchQueue(item.id, { status: "done", progress: 1 });
+            url,
+            filename,
+          });
         } catch (err) {
           const message =
             err instanceof Error ? err.message : "Export fehlgeschlagen";
@@ -533,7 +587,9 @@ export function Studio() {
       }
       const left = queueRef.current.filter((q) => q.status === "queued").length;
       if (queueCancelRef.current) toast("Queue angehalten");
-      else if (left === 0) toast.success("Queue fertig");
+      else if (left === 0) {
+        toast.success(folder ? "Queue im Ordner gespeichert" : "Queue fertig");
+      }
     } finally {
       queueRunRef.current = false;
       setQueueRunning(false);
@@ -659,6 +715,21 @@ export function Studio() {
                 <Download />
                 WebM
               </Button>
+              {lastExport ? (
+                <a
+                  href={lastExport.url}
+                  download={lastExport.filename}
+                  className="inline-flex h-8 items-center gap-1.5 rounded-md bg-raised px-2.5 text-xs font-medium text-fg shadow-border"
+                  onClick={(e) => {
+                    if (!canUseSavePicker()) return;
+                    e.preventDefault();
+                    void saveBlob(lastExport.blob, lastExport.filename);
+                  }}
+                >
+                  <Download className="size-3.5" />
+                  Speichern
+                </a>
+              ) : null}
               <Button
                 type="button"
                 size="sm"
@@ -790,22 +861,48 @@ export function Studio() {
                                 : item.error ?? "Fehler"}
                       </span>
                     </span>
-                    {(item.status === "queued" ||
-                      item.status === "error" ||
-                      item.status === "done") && (
-                      <button
-                        type="button"
-                        className="grid size-8 place-items-center text-muted hover:text-danger"
-                        onClick={() =>
-                          setQueue((list) =>
-                            list.filter((q) => q.id !== item.id),
-                          )
-                        }
-                        aria-label="Aus Queue entfernen"
-                      >
-                        <Trash2 className="size-3.5" />
-                      </button>
-                    )}
+                    {(item.status === "done" && item.blob) ||
+                    item.status === "queued" ||
+                    item.status === "error" ||
+                    item.status === "done" ? (
+                      <span className="flex shrink-0 gap-0.5">
+                        {item.status === "done" && (item.url || item.blob) ? (
+                          <a
+                            href={item.url ?? "#"}
+                            download={item.filename ?? `graphit-${item.id}.webm`}
+                            className="grid size-8 place-items-center text-muted hover:text-fg"
+                            aria-label="Video herunterladen"
+                            onClick={(e) => {
+                              if (!item.blob || !canUseSavePicker()) return;
+                              e.preventDefault();
+                              void saveBlob(
+                                item.blob,
+                                item.filename ?? `graphit-${item.id}.webm`,
+                              );
+                            }}
+                          >
+                            <Download className="size-3.5" />
+                          </a>
+                        ) : null}
+                        {(item.status === "queued" ||
+                          item.status === "error" ||
+                          item.status === "done") && (
+                          <button
+                            type="button"
+                            className="grid size-8 place-items-center text-muted hover:text-danger"
+                            onClick={() => {
+                              if (item.url) URL.revokeObjectURL(item.url);
+                              setQueue((list) =>
+                                list.filter((q) => q.id !== item.id),
+                              );
+                            }}
+                            aria-label="Aus Queue entfernen"
+                          >
+                            <Trash2 className="size-3.5" />
+                          </button>
+                        )}
+                      </span>
+                    ) : null}
                   </li>
                 ))}
               </ul>

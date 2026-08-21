@@ -64,22 +64,13 @@ export function nextStartMs(plates: Plate[]): number {
 
 export function clampFrame(frame: FrameRect): FrameRect {
   const min = 0.08;
-  const w = Math.min(1, Math.max(min, frame.w));
-  const h = Math.min(1, Math.max(min, frame.h));
-  const x = Math.min(1 - w, Math.max(0, frame.x));
-  const y = Math.min(1 - h, Math.max(0, frame.y));
+  const max = 2.5;
+  const w = Math.min(max, Math.max(min, frame.w));
+  const h = Math.min(max, Math.max(min, frame.h));
+  const keep = 0.05;
+  const x = Math.min(1 - keep, Math.max(keep - w, frame.x));
+  const y = Math.min(1 - keep, Math.max(keep - h, frame.y));
   return { x, y, w, h };
-}
-
-function paperFade(r: number, g: number, b: number, key: number): number {
-  if (key <= 0) return 0;
-  const luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-  const lo = 255 - 125 * key;
-  const hi = 255 - 8 * key;
-  let fade = 0;
-  if (luma >= hi) fade = 1;
-  else if (luma > lo) fade = (luma - lo) / Math.max(1, hi - lo);
-  return fade * key;
 }
 
 function blitContain(
@@ -89,8 +80,6 @@ function blitContain(
   fy: number,
   fw: number,
   fh: number,
-  key: number,
-  scratch: HTMLCanvasElement,
 ) {
   if (src.width < 1 || src.height < 1 || fw < 1 || fh < 1) return;
   const scale = Math.min(fw / src.width, fh / src.height);
@@ -98,42 +87,19 @@ function blitContain(
   const dh = src.height * scale;
   const dx = fx + (fw - dw) / 2;
   const dy = fy + (fh - dh) / 2;
-
-  if (key <= 0.001) {
-    ctx.drawImage(src, dx, dy, dw, dh);
-    return;
-  }
-
-  if (scratch.width !== src.width || scratch.height !== src.height) {
-    scratch.width = src.width;
-    scratch.height = src.height;
-  }
-  const sctx = scratch.getContext("2d", { alpha: true });
-  if (!sctx) {
-    ctx.drawImage(src, dx, dy, dw, dh);
-    return;
-  }
-  sctx.clearRect(0, 0, src.width, src.height);
-  sctx.drawImage(src, 0, 0);
-  const img = sctx.getImageData(0, 0, src.width, src.height);
-  const data = img.data;
-  for (let p = 0; p < data.length; p += 4) {
-    const fade = paperFade(data[p]!, data[p + 1]!, data[p + 2]!, key);
-    if (fade > 0) data[p + 3] = Math.round(data[p + 3]! * (1 - fade));
-  }
-  sctx.putImageData(img, 0, 0);
-  ctx.drawImage(scratch, dx, dy, dw, dh);
+  ctx.drawImage(src, dx, dy, dw, dh);
 }
 
 export class StageRenderer {
   readonly canvas: HTMLCanvasElement;
   private readonly ctx: CanvasRenderingContext2D;
   private readonly plates = new Map<string, GraphiteRenderer>();
-  private readonly scratch = document.createElement("canvas");
   stage: StageSize;
 
   constructor(canvas: HTMLCanvasElement, stage: StageSize) {
-    const ctx = canvas.getContext("2d", { alpha: false });
+    const ctx =
+      canvas.getContext("2d", { alpha: false, desynchronized: true }) ??
+      canvas.getContext("2d");
     if (!ctx) throw new Error("Canvas nicht verfügbar");
     this.canvas = canvas;
     this.ctx = ctx;
@@ -202,16 +168,7 @@ export class StageRenderer {
       const fy = plate.frame.y * height;
       const fw = plate.frame.w * width;
       const fh = plate.frame.h * height;
-      blitContain(
-        ctx,
-        renderer.canvas,
-        fx,
-        fy,
-        fw,
-        fh,
-        (plate.transparency ?? 100) / 100,
-        this.scratch,
-      );
+      blitContain(ctx, renderer.canvas, fx, fy, fw, fh);
     }
     this.prune(live);
     return mode === "animation" ? compositionPhase(plates, tMs) : null;

@@ -956,5 +956,10 @@ export async function analyzeSource(
   params: AnalyzeParams = DEFAULT_PARAMS,
 ): Promise<GraphiteJob> {
   const { width, height, data } = await loadRaster(source, params.maxSize);
-  return analyzeRaster(width, height, data, params);
+  try {
+    const { analyzeRasterOffthread } = await import("./pool");
+    return await analyzeRasterOffthread(width, height, data, params);
+  } catch {
+    return analyzeRaster(width, height, data, params);
+  }
 }

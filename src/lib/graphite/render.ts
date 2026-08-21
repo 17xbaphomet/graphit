@@ -248,7 +248,7 @@ export class GraphiteRenderer {
   private key = 0;
 
   constructor(canvas: HTMLCanvasElement, job: GraphiteJob, timeline: Timeline) {
-    const ctx = canvas.getContext("2d", { alpha: true });
+    const ctx = canvas.getContext("2d", { alpha: true, desynchronized: true });
     if (!ctx) throw new Error("Canvas nicht verfügbar");
     this.canvas = canvas;
     this.ctx = ctx;

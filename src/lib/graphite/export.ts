@@ -41,26 +41,53 @@ async function pickCodec(
   width: number,
   height: number,
   bitrate: number,
-): Promise<{ codec: string; mux: "V_VP9" | "V_VP8" } | null> {
+): Promise<{
+  mux: "V_VP9" | "V_VP8";
+  config: VideoEncoderConfig;
+} | null> {
   if (typeof VideoEncoder === "undefined" || !VideoEncoder.isConfigSupported) {
     return null;
   }
-  const options = [
-    { codec: "vp09.00.10.08", mux: "V_VP9" as const },
-    { codec: "vp8", mux: "V_VP8" as const },
+  const luma = width * height;
+  const vp9 =
+    luma > 8_000_000
+      ? ["vp09.00.51.08", "vp09.00.50.08"]
+      : luma > 2_200_000
+        ? ["vp09.00.50.08", "vp09.00.41.08", "vp09.00.40.08"]
+        : ["vp09.00.40.08", "vp09.00.31.08"];
+  const codecs: { codec: string; mux: "V_VP9" | "V_VP8" }[] = [
+    ...vp9.map((codec) => ({ codec, mux: "V_VP9" as const })),
+    { codec: "vp8", mux: "V_VP8" },
   ];
-  for (const option of options) {
-    try {
-      const check = await VideoEncoder.isConfigSupported({
+  const hwModes: Array<VideoEncoderConfig["hardwareAcceleration"] | undefined> =
+    luma >= 2560 * 1440
+      ? [undefined, "prefer-software"]
+      : ["prefer-hardware", undefined, "prefer-software"];
+  const latency: VideoEncoderConfig["latencyMode"] =
+    luma >= 2560 * 1440 ? "realtime" : "quality";
+
+  for (const option of codecs) {
+    for (const hw of hwModes) {
+      const config: VideoEncoderConfig = {
         codec: option.codec,
         width,
         height,
         bitrate,
         framerate: EXPORT_FPS,
-      });
-      if (check.supported) return option;
-    } catch {
-      /* try next */
+        latencyMode: latency,
+      };
+      if (hw) config.hardwareAcceleration = hw;
+      try {
+        const check = await VideoEncoder.isConfigSupported(config);
+        if (check.supported) {
+          return {
+            mux: option.mux,
+            config: (check.config as VideoEncoderConfig | undefined) ?? config,
+          };
+        }
+      } catch {
+        /* try next */
+      }
     }
   }
   return null;
@@ -96,6 +123,10 @@ async function encodeTimedWebM(
     firstTimestampBehavior: "offset",
   });
 
+  const luma = width * height;
+  const maxQueue = luma >= 2560 * 1440 ? 4 : 12;
+  const drainTo = Math.max(1, Math.floor(maxQueue / 2));
+
   let failed: Error | null = null;
   const encoder = new VideoEncoder({
     output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
@@ -103,45 +134,51 @@ async function encodeTimedWebM(
       failed = err instanceof Error ? err : new Error(String(err));
     },
   });
-  encoder.configure({
-    codec: picked.codec,
-    width,
-    height,
-    bitrate,
-    framerate: EXPORT_FPS,
-    latencyMode: "quality",
-  });
 
-  for (let f = 0; f < frames; f++) {
-    if (failed) throw failed;
-    const t = frames === 1 ? 0 : (f / (frames - 1)) * durationMs;
-    draw(t);
-    const videoFrame = new VideoFrame(canvas, {
-      timestamp: Math.round(f * frameUs),
-      duration: Math.round(frameUs),
-    });
-    encoder.encode(videoFrame, { keyFrame: f % EXPORT_FPS === 0 });
-    videoFrame.close();
-    if (encoder.encodeQueueSize > 8) {
-      await new Promise<void>((resolve) => {
-        const tick = () => {
-          if (encoder.encodeQueueSize <= 4) resolve();
-          else window.setTimeout(tick, 8);
-        };
-        tick();
+  try {
+    encoder.configure(picked.config);
+
+    for (let f = 0; f < frames; f++) {
+      if (failed) throw failed;
+      const t = frames === 1 ? 0 : (f / (frames - 1)) * durationMs;
+      draw(t);
+      const videoFrame = new VideoFrame(canvas, {
+        timestamp: Math.round(f * frameUs),
+        duration: Math.round(frameUs),
       });
+      try {
+        encoder.encode(videoFrame, { keyFrame: f % EXPORT_FPS === 0 });
+      } finally {
+        videoFrame.close();
+      }
+      if (encoder.encodeQueueSize > maxQueue) {
+        await new Promise<void>((resolve) => {
+          const tick = () => {
+            if (failed || encoder.encodeQueueSize <= drainTo) resolve();
+            else window.setTimeout(tick, 8);
+          };
+          tick();
+        });
+      }
+      if (f % 8 === 0) {
+        onProgress?.(f / frames);
+        await sleep(0);
+      }
     }
-    if (f % 3 === 0) {
-      onProgress?.(f / frames);
-      await sleep(0);
+
+    await encoder.flush();
+    if (failed) throw failed;
+    muxer.finalize();
+    return new Blob([target.buffer], { type: "video/webm" });
+  } catch {
+    return null;
+  } finally {
+    try {
+      if (encoder.state !== "closed") encoder.close();
+    } catch {
+      /* already closed */
     }
   }
-
-  await encoder.flush();
-  encoder.close();
-  if (failed) throw failed;
-  muxer.finalize();
-  return new Blob([target.buffer], { type: "video/webm" });
 }
 
 async function recordPacedWebM(
@@ -201,18 +238,28 @@ async function recordCanvas(
   onProgress?: (ratio: number) => void,
 ): Promise<Blob> {
   const bitrate = Math.min(
-    48_000_000,
-    Math.max(6_000_000, Math.round(pixels * 2.4)),
+    lumaCap(pixels),
+    Math.max(6_000_000, Math.round(pixels * 1.8)),
   );
-  const timed = await encodeTimedWebM(
-    canvas,
-    durationMs,
-    bitrate,
-    draw,
-    onProgress,
-  );
-  if (timed) return timed;
+  try {
+    const timed = await encodeTimedWebM(
+      canvas,
+      durationMs,
+      bitrate,
+      draw,
+      onProgress,
+    );
+    if (timed) return timed;
+  } catch {
+    /* MediaRecorder fallback */
+  }
   return recordPacedWebM(canvas, durationMs, bitrate, draw, onProgress);
+}
+
+function lumaCap(pixels: number) {
+  if (pixels >= 3840 * 2160) return 28_000_000;
+  if (pixels >= 2560 * 1440) return 22_000_000;
+  return 48_000_000;
 }
 
 export async function exportWebM(
@@ -255,11 +302,97 @@ export async function exportCompositionWebM(
   );
 }
 
+function isTopWindow(): boolean {
+  try {
+    return window.self === window.top;
+  } catch {
+    return false;
+  }
+}
+
+export function canUseFolderPicker(): boolean {
+  return isTopWindow() && "showDirectoryPicker" in window;
+}
+
+export function canUseSavePicker(): boolean {
+  return isTopWindow() && "showSaveFilePicker" in window;
+}
+
+export function objectUrlFor(blob: Blob): string {
+  return URL.createObjectURL(blob);
+}
+
 export function downloadBlob(blob: Blob, filename: string) {
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
   a.download = filename;
+  a.rel = "noopener";
+  a.target = "_blank";
+  a.type = blob.type || "video/webm";
+  document.body.appendChild(a);
   a.click();
-  window.setTimeout(() => URL.revokeObjectURL(url), 4_000);
+  window.setTimeout(() => {
+    a.remove();
+    URL.revokeObjectURL(url);
+  }, 8_000);
+}
+
+export async function saveBlob(blob: Blob, filename: string): Promise<boolean> {
+  const w = window as Window & {
+    showSaveFilePicker?: (opts: {
+      suggestedName?: string;
+      types?: Array<{ description: string; accept: Record<string, string[]> }>;
+    }) => Promise<FileSystemFileHandle>;
+  };
+  if (isTopWindow() && w.showSaveFilePicker) {
+    try {
+      const handle = await w.showSaveFilePicker({
+        suggestedName: filename,
+        types: [
+          {
+            description: "WebM-Video",
+            accept: { "video/webm": [".webm"] },
+          },
+        ],
+      });
+      const writable = await handle.createWritable();
+      await writable.write(blob);
+      await writable.close();
+      return true;
+    } catch (err) {
+      if (err instanceof DOMException && err.name === "AbortError") return false;
+    }
+  }
+  downloadBlob(blob, filename);
+  return true;
+}
+
+export async function pickExportDirectory(): Promise<FileSystemDirectoryHandle | null> {
+  if (!canUseFolderPicker()) return null;
+  const picker = (
+    window as Window & {
+      showDirectoryPicker?: (opts?: {
+        id?: string;
+        mode?: "read" | "readwrite";
+      }) => Promise<FileSystemDirectoryHandle>;
+    }
+  ).showDirectoryPicker;
+  if (!picker) return null;
+  try {
+    return await picker({ id: "graphit-exports", mode: "readwrite" });
+  } catch {
+    return null;
+  }
+}
+
+export async function writeBlobToDirectory(
+  dir: FileSystemDirectoryHandle,
+  filename: string,
+  blob: Blob,
+): Promise<void> {
+  const handle = await dir.getFileHandle(filename, { create: true });
+  const writable = await handle.createWritable();
+  await writable.write(blob);
+  await writable.close();
 }

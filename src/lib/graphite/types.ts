@@ -104,6 +104,9 @@ export type RenderQueueItem = {
   status: RenderQueueStatus;
   progress: number;
   error?: string;
+  blob?: Blob;
+  url?: string;
+  filename?: string;
 };
 
 export type StageSize = {
