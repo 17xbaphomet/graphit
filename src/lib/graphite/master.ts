@@ -7,6 +7,7 @@ import type {
   Timeline,
 } from "./types";
 import { DEFAULT_OVERRIDES } from "./types";
+import { textWriteMs } from "./text";
 
 export function sameParams(a: AnalyzeParams, b: AnalyzeParams): boolean {
   return (
@@ -41,6 +42,18 @@ export function resolvedParams(plate: Plate, master: ExportMaster): AnalyzeParam
 
 export function resolvedTimeline(plate: Plate, master: ExportMaster): Timeline {
   const o = overridesOf(plate);
+  if (plate.kind === "text") {
+    const pixels = plate.job?.lineOrder.length ?? 0;
+    return {
+      lineMs: pixels
+        ? textWriteMs(pixels, plate.text?.speed ?? 1)
+        : o.lineMs
+          ? plate.timeline.lineMs
+          : master.timeline.lineMs,
+      toneMs: 0,
+      holdMs: o.holdMs ? plate.timeline.holdMs : master.timeline.holdMs,
+    };
+  }
   return {
     lineMs: o.lineMs ? plate.timeline.lineMs : master.timeline.lineMs,
     toneMs: o.toneMs ? plate.timeline.toneMs : master.timeline.toneMs,

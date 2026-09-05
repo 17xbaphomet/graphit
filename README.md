@@ -1,35 +1,46 @@
 # Graphit
 
-Zeichenanimation aus einem Graustufenbild.
+Zeichenanimation aus Graustufenbildern — im Studio oder als **ComfyUI-Node**.
 
-Zuerst zieht eine Hand die schwarzen Linien — ein zusammenhängender Zug, Form für Form. Danach legt dieselbe Hand die Tonwerte, dunkel zuerst, als Schraffur den Flächen entlang.
+Zuerst die schwarzen Linien als Zug, dann die Tonwerte dunkel zuerst.
 
-## Lokal starten
+## Studio
 
 ```bash
 npm install
 npm run dev
 ```
 
-Öffnet die Studio-Oberfläche (Port 8080). Bild laden oder eine der Vorlagen wählen, abspielen, als WebM exportieren.
+Bild laden, Rahmen und Zeiten setzen, **Comfy JSON** exportieren.
 
-## Einstellungen
+## ComfyUI
 
-| Gruppe | Parameter |
+Ordner [`comfy_graphit/`](comfy_graphit/) nach `ComfyUI/custom_nodes/graphit` kopieren.
+
+- **Graphit Animate** — `IMAGE` + JSON → Frame-Batch
+- **Graphit Config JSON** — Slider bauen das JSON
+
+Bilder gehen in `image` / `image_1` / … JSON legt Bühne, Zeiten, Frames, Master und Textplatten fest. Beispiel: [`comfy_graphit/example.json`](comfy_graphit/example.json).
+
+Platte überschreibt den Master, sobald das Feld im JSON steht.
+
+## LLM-Steuerung
+
+| URL | Format |
 | --- | --- |
-| Bild | Auflösung bis **4K UHD** (3840 px längste Seite), Presets HD / FHD / QHD / 4K |
-| Ablauf | Liniendauer, Tondauer, Halten, Schleife |
-| Erkennung | Tonstufen, Kanten, Tusche, Feinstriche, dunkle Konturen |
+| [/llms.txt](/llms.txt) | Markdown, Endpunkte, Felder, Regeln, Beispiele |
+| [/api/tool](/api/tool) | dasselbe als JSON für Function Calling |
+| [/api/schema](/api/schema) | JSON-Schema der Anfrage |
 
-Änderungen an Bild und Erkennung gelten nach **Änderungen anwenden**. Ablauf wirkt sofort.
-
-## Technik
-
-- React 19, TanStack Start, Vite, Tailwind v4
-- Kantenerkennung (Sobel) + Kontur-Tracing
-- Zeichenreihenfolge: nächster Strich zur Stiftposition
-- Tonstufen werden genauso abgelaufen, nicht als Welle
-- Export über `MediaRecorder` (WebM)
+| Feld | Bedeutung |
+| --- | --- |
+| `stage.width/height` | Ausgabefläche bis 4K |
+| `fps` | Frames |
+| `master.*` | Erkennung + Zeiten für alle Platten |
+| `plates[].image` | Index des angeschlossenen Bildes |
+| `plates[].frame` | relative Lage `x,y,w,h` (0–1, darf überstehen) |
+| `plates[].startMs` | Start auf der Timeline |
+| `plates[].kind` | `image` oder `text` |
 
 ## Lizenz
 

@@ -87,6 +87,8 @@ function blitContain(
   const dh = src.height * scale;
   const dx = fx + (fw - dw) / 2;
   const dy = fy + (fh - dh) / 2;
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
   ctx.drawImage(src, dx, dy, dw, dh);
 }
 

@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "stage": { "width": 1280, "height": 720 },
+  "fps": 30,
+  "paper": [243, 238, 228],
+  "master": {
+    "maxSize": 680,
+    "edgeThreshold": 16,
+    "inkThreshold": 38,
+    "includeInk": true,
+    "minStroke": 3,
+    "levels": 10,
+    "lineMs": 4800,
+    "toneMs": 7200,
+    "holdMs": 1600,
+    "transparency": 100
+  },
+  "plates": [
+    {
+      "image": 0,
+      "kind": "image",
+      "name": "skizze",
+      "frame": { "x": 0.04, "y": 0.04, "w": 0.92, "h": 0.92 },
+      "startMs": 0
+    },
+    {
+      "kind": "text",
+      "name": "titel",
+      "frame": { "x": 0.08, "y": 0.78, "w": 0.84, "h": 0.18 },
+      "startMs": 9000,
+      "text": {
+        "content": "Graphit",
+        "fontFamily": "DejaVu Serif",
+        "fontWeight": 400,
+        "italic": false,
+        "speed": 1
+      }
+    }
+  ]
+}

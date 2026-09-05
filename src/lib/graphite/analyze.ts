@@ -167,7 +167,7 @@ const RING: readonly [number, number][] = [
 ];
 
 /** Zhang–Suen: fat edge blobs become 1px ridges. */
-function thinMask(mask: Uint8Array, w: number, h: number): Uint8Array {
+export function thinMask(mask: Uint8Array, w: number, h: number): Uint8Array {
   const img = new Uint8Array(mask);
   let changed = true;
   for (let pass = 0; pass < 48 && changed; pass++) {
@@ -333,7 +333,7 @@ function pickNext(
   return best;
 }
 
-function traceStrokes(mask: Uint8Array, w: number, h: number): number[][] {
+export function traceStrokes(mask: Uint8Array, w: number, h: number): number[][] {
   const n = w * h;
   const visited = new Uint8Array(n);
   const pixels: number[] = [];
@@ -383,7 +383,7 @@ type TourOpts = {
   startY?: number;
 };
 
-function flattenStrokes(
+export function flattenStrokes(
   strokes: number[][],
   w: number,
   opts: TourOpts = {},

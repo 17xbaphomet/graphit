@@ -15,6 +15,7 @@ function clonePlate(plate: Plate): Plate {
     applied: { ...plate.applied },
     overrides: { ...plate.overrides },
     frame: { ...plate.frame },
+    text: plate.text ? { ...plate.text } : undefined,
   };
 }
 

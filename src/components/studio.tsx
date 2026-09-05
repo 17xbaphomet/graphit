@@ -13,6 +13,8 @@ import {
   RotateCcw,
   Square,
   Trash2,
+  Type,
+  Braces,
 } from "lucide-react";
 import { toast } from "sonner";
 import { AuthSlot } from "@/components/auth-slot";
@@ -23,6 +25,14 @@ import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
 import { Slider } from "@/components/ui/slider";
 import { analyzeSource } from "@/lib/graphite/analyze";
+import {
+  DEFAULT_TEXT,
+  SYSTEM_FONTS,
+  analyzeText,
+  registerFontFile,
+  textSignature,
+  textWriteMs,
+} from "@/lib/graphite/text";
 import {
   StageRenderer,
   compositionDuration,
@@ -40,6 +50,7 @@ import {
   canUseFolderPicker,
   canUseSavePicker,
 } from "@/lib/graphite/export";
+import { compositionToConfig } from "@/lib/graphite/config";
 import { applyOverride, resolvePlates, resolvedParams, sameParams } from "@/lib/graphite/master";
 import { hardwareLimit, mapLimit } from "@/lib/graphite/pool";
 import { fileSlug, queueItemDuration, snapshotComposition } from "@/lib/graphite/queue";
@@ -58,6 +69,7 @@ import {
   type Plate,
   type RenderQueueItem,
   type StageSize,
+  type TextSpec,
   type Timeline,
 } from "@/lib/graphite/types";
 import { cn } from "@/lib/utils";
@@ -73,6 +85,13 @@ type ViewMode = "animation" | "lines" | "original";
 function formatMs(ms: number) {
   const n = Number.isFinite(ms) ? ms : 0;
   return `${(n / 1000).toFixed(1)} s`;
+}
+
+function formatSpeed(speed: number) {
+  const s = Number.isFinite(speed) ? speed : 1;
+  if (s <= 0.45) return `${s.toFixed(2)}× langsam`;
+  if (s >= 1.7) return `${s.toFixed(2)}× schnell`;
+  return `${s.toFixed(2)}×`;
 }
 
 function formatSize(px: number) {
@@ -129,6 +148,11 @@ export function Studio() {
   const stageRef = useRef<StageRenderer | null>(null);
   const clockRef = useRef({ playing: false, origin: 0, t: 0 });
   const fileRef = useRef<HTMLInputElement>(null);
+  const fontRef = useRef<HTMLInputElement>(null);
+  const [textDraft, setTextDraft] = useState<TextSpec>({ ...DEFAULT_TEXT });
+  const [customFonts, setCustomFonts] = useState<
+    { label: string; family: string; file: File }[]
+  >([]);
   const platesRef = useRef<Plate[]>([]);
   const resolvedRef = useRef<Plate[]>([]);
   const genRef = useRef(0);
@@ -203,6 +227,24 @@ export function Studio() {
 
   const analyzePlate = useCallback(async (plate: Plate) => {
     const params = resolvedParams(plate, master);
+    if (plate.kind === "text" && plate.text) {
+      let spec = plate.text;
+      if (plate.fontFile) {
+        const family = await registerFontFile(plate.fontFile);
+        if (family !== spec.fontFamily) {
+          spec = { ...spec, fontFamily: family };
+          plate = { ...plate, text: spec };
+        }
+      }
+      const { job, thumb } = await analyzeText(spec, params);
+      return {
+        ...plate,
+        job,
+        thumb,
+        applied: { ...params },
+        appliedText: textSignature(spec),
+      };
+    }
     const job = await analyzeSource(plate.source, params);
     return {
       ...plate,
@@ -275,10 +317,61 @@ export function Studio() {
     [analyzePlate, ensureStage, master, paint],
   );
 
+  const addTextPlate = useCallback(async () => {
+    const gen = ++genRef.current;
+    setBusy(true);
+    setError(null);
+    setPlaying(false);
+    clockRef.current.playing = false;
+    try {
+      let spec: TextSpec = {
+        ...textDraft,
+        content: textDraft.content.replace(/\s+$/g, "") || "Text",
+      };
+      const custom = customFonts.find((f) => f.family === spec.fontFamily);
+      const file = custom?.file;
+      if (file) {
+        spec = {
+          ...spec,
+          fontFamily: await registerFontFile(file),
+        };
+      }
+      const plate = makePlate(`text:${newId()}`, platesRef.current, {
+        kind: "text",
+        name: spec.content.split("\n")[0]!.slice(0, 28),
+        text: spec,
+        fontFile: file,
+        thumb: "",
+      });
+      setBusyLabel("Text wird gesetzt");
+      const done = await analyzePlate(plate);
+      if (gen !== genRef.current) return;
+      const working = [...platesRef.current, done];
+      platesRef.current = working;
+      setPlates(working);
+      setSelectedId(done.id);
+      ensureStage();
+      clockRef.current.t = 0;
+      setTMs(0);
+      setView("animation");
+      paint(0, "animation", resolvePlates(working, master));
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : "Text fehlgeschlagen";
+      setError(message);
+      toast.error(message);
+    } finally {
+      setBusy(false);
+    }
+  }, [analyzePlate, customFonts, ensureStage, master, paint, textDraft]);
+
   useEffect(() => {
     if (busy || exporting) return;
     const stale = plates.filter(
-      (p) => !p.job || !sameParams(resolvedParams(p, master), p.applied),
+      (p) =>
+        !p.job ||
+        !sameParams(resolvedParams(p, master), p.applied) ||
+        (p.kind === "text" && textSignature(p.text) !== p.appliedText),
     );
     if (stale.length === 0) return;
     const timer = window.setTimeout(() => {
@@ -292,7 +385,10 @@ export function Studio() {
             working
               .filter(
                 (p) =>
-                  !p.job || !sameParams(resolvedParams(p, master), p.applied),
+                  !p.job ||
+                  !sameParams(resolvedParams(p, master), p.applied) ||
+                  (p.kind === "text" &&
+                    textSignature(p.text) !== p.appliedText),
               )
               .map((p) => p.id),
           );
@@ -480,12 +576,47 @@ export function Studio() {
 
   const preparePlates = async (source: Plate[]) => {
     return mapLimit(source, hardwareLimit(), async (plate) => {
+      if (plate.kind === "text" && plate.text) {
+        let spec = plate.text;
+        if (
+          plate.job &&
+          sameParams(plate.params, plate.applied) &&
+          textSignature(spec) === plate.appliedText
+        ) {
+          return plate;
+        }
+        if (plate.fontFile) {
+          const family = await registerFontFile(plate.fontFile);
+          spec = { ...spec, fontFamily: family };
+          plate = { ...plate, text: spec };
+        }
+        const { job, thumb } = await analyzeText(spec, plate.params);
+        return {
+          ...plate,
+          job,
+          thumb,
+          applied: { ...plate.params },
+          appliedText: textSignature(spec),
+        };
+      }
       if (!plate.job || !sameParams(plate.params, plate.applied)) {
         const job = await analyzeSource(plate.source, plate.params);
         return { ...plate, job, applied: { ...plate.params } };
       }
       return plate;
     });
+  };
+
+  const onExportJson = () => {
+    const cfg = compositionToConfig(stage, plates, master, 30);
+    const text = JSON.stringify(cfg, null, 2);
+    const blob = new Blob([text], { type: "application/json" });
+    const name = `graphit-${plates[0]?.name ?? "komposition"}.json`.replace(/\s+/g, "-");
+    downloadBlob(blob, name);
+    void navigator.clipboard.writeText(text).then(
+      () => toast.success("Comfy-JSON kopiert und heruntergeladen"),
+      () => toast.success("Comfy-JSON heruntergeladen"),
+    );
   };
 
   const onExport = async () => {
@@ -614,7 +745,8 @@ export function Studio() {
             Graphit
           </h1>
           <p className="mt-3 max-w-md text-pretty text-sm leading-normal text-muted">
-            Mehrere Bilder auf einer Fläche. Der Export-Master gilt für alle,
+            Mehrere Bilder auf einer Fläche. JSON steuert denselben Ablauf in
+            ComfyUI (Node Graphit Animate).
             außer ein Bild überschreibt eine Einstellung mit „Eigen“.
           </p>
         </div>
@@ -627,6 +759,15 @@ export function Studio() {
           >
             <ImagePlus />
             Bilder laden
+          </Button>
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => void addTextPlate()}
+            disabled={busy || exporting}
+          >
+            <Type />
+            Text
           </Button>
           <input
             ref={fileRef}
@@ -714,6 +855,16 @@ export function Studio() {
               >
                 <Download />
                 WebM
+              </Button>
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                onClick={onExportJson}
+                disabled={plates.length === 0}
+              >
+                <Braces />
+                Comfy JSON
               </Button>
               {lastExport ? (
                 <a
@@ -957,7 +1108,7 @@ export function Studio() {
             </legend>
             <p className="text-xs leading-normal text-subtle">
               Gilt für alle Bilder. Ein Bild mit „Eigen“ behält seinen eigenen
-              Wert.
+              Wert. Dieselbe Master-JSON geht nach ComfyUI.
             </p>
             <Field
               label="Transparenz"
@@ -1149,6 +1300,129 @@ export function Studio() {
                 </button>
               ))}
             </div>
+            <div className="mt-3 flex flex-col gap-2 rounded-md bg-raised p-2 shadow-border">
+              <Label htmlFor="graphit-text">Text</Label>
+              <textarea
+                id="graphit-text"
+                rows={3}
+                value={textDraft.content}
+                onChange={(e) =>
+                  setTextDraft((t) => ({ ...t, content: e.target.value }))
+                }
+                className="min-h-16 w-full resize-y rounded-md bg-surface px-2 py-1.5 text-sm text-fg shadow-border outline-none"
+                placeholder="Von links nach rechts schreiben…"
+              />
+              <label className="flex flex-col gap-1 text-xs text-muted">
+                Schrift
+                <select
+                  value={textDraft.fontFamily}
+                  onChange={(e) =>
+                    setTextDraft((t) => ({ ...t, fontFamily: e.target.value }))
+                  }
+                  className="min-h-11 rounded-md bg-surface px-2 text-sm text-fg shadow-border"
+                  style={{ fontFamily: textDraft.fontFamily }}
+                >
+                  {SYSTEM_FONTS.map((f) => (
+                    <option key={f.family} value={f.family}>
+                      {f.label}
+                    </option>
+                  ))}
+                  {customFonts.map((f) => (
+                    <option key={f.family} value={f.family}>
+                      {f.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <div className="flex flex-wrap items-center gap-2">
+                <label className="flex min-h-11 items-center gap-2 text-xs text-fg">
+                  <input
+                    type="checkbox"
+                    checked={textDraft.italic}
+                    onChange={(e) =>
+                      setTextDraft((t) => ({ ...t, italic: e.target.checked }))
+                    }
+                    className="size-4 accent-fg"
+                  />
+                  Kursiv
+                </label>
+                <label className="flex min-h-11 items-center gap-2 text-xs text-fg">
+                  Gewicht
+                  <input
+                    type="range"
+                    min={300}
+                    max={800}
+                    step={100}
+                    value={textDraft.fontWeight}
+                    onChange={(e) =>
+                      setTextDraft((t) => ({
+                        ...t,
+                        fontWeight: Number(e.target.value),
+                      }))
+                    }
+                  />
+                </label>
+              </div>
+              <label className="flex flex-col gap-1 text-xs text-muted">
+                Schreibtempo {formatSpeed(textDraft.speed ?? 1)}
+                <input
+                  type="range"
+                  min={0.25}
+                  max={2.5}
+                  step={0.05}
+                  value={textDraft.speed ?? 1}
+                  onChange={(e) =>
+                    setTextDraft((t) => ({
+                      ...t,
+                      speed: Number(e.target.value),
+                    }))
+                  }
+                />
+              </label>
+              <div className="flex gap-2">
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  onClick={() => fontRef.current?.click()}
+                >
+                  Font-Datei
+                </Button>
+                <input
+                  ref={fontRef}
+                  type="file"
+                  accept=".ttf,.otf,.woff,.woff2,font/ttf,font/otf,font/woff,font/woff2"
+                  className="sr-only"
+                  onChange={(e) => {
+                    const file = e.target.files?.[0];
+                    e.target.value = "";
+                    if (!file) return;
+                    void (async () => {
+                      try {
+                        const family = await registerFontFile(file);
+                        const label = file.name.replace(/\.[^.]+$/, "");
+                        setCustomFonts((list) => [
+                          ...list.filter((f) => f.file !== file),
+                          { label, family, file },
+                        ]);
+                        setTextDraft((t) => ({ ...t, fontFamily: family }));
+                      } catch {
+                        toast.error("Font konnte nicht geladen werden");
+                      }
+                    })();
+                  }}
+                />
+                <Button
+                  type="button"
+                  size="sm"
+                  onClick={() => void addTextPlate()}
+                  disabled={busy || exporting}
+                >
+                  <Type />
+                  Schreiben
+                </Button>
+              </div>
+            </div>
             <ul className="mt-3 flex flex-col gap-1.5">
               {plates.map((plate, i) => (
                 <li key={plate.id}>
@@ -1162,11 +1436,17 @@ export function Studio() {
                         : "hover:bg-raised/60",
                     )}
                   >
-                    <img
-                      src={plate.thumb}
-                      alt=""
-                      className="size-8 shrink-0 rounded-sm object-cover"
-                    />
+                    {plate.thumb ? (
+                      <img
+                        src={plate.thumb}
+                        alt=""
+                        className="size-8 shrink-0 rounded-sm object-cover"
+                      />
+                    ) : (
+                      <span className="grid size-8 shrink-0 place-items-center rounded-sm bg-paper text-ink">
+                        <Type className="size-3.5" />
+                      </span>
+                    )}
                     <span className="min-w-0 flex-1">
                       <span className="block truncate text-xs font-medium text-fg">
                         {i + 1}. {plate.name}
@@ -1238,6 +1518,95 @@ export function Studio() {
                     }
                   />
                 </Field>
+                {selected.kind === "text" && selected.text ? (
+                  <div className="flex flex-col gap-2">
+                    <Label htmlFor="plate-text">Inhalt</Label>
+                    <textarea
+                      id="plate-text"
+                      rows={3}
+                      value={selected.text.content}
+                      onChange={(e) =>
+                        updatePlate(selected.id, {
+                          text: {
+                            ...selected.text!,
+                            content: e.target.value,
+                          },
+                          name: e.target.value.split("\n")[0]!.slice(0, 28) || "Text",
+                        })
+                      }
+                      className="min-h-16 w-full resize-y rounded-md bg-surface px-2 py-1.5 text-sm text-fg shadow-border outline-none"
+                    />
+                    <select
+                      value={selected.text.fontFamily}
+                      onChange={(e) =>
+                        updatePlate(selected.id, {
+                          text: {
+                            ...selected.text!,
+                            fontFamily: e.target.value,
+                          },
+                        })
+                      }
+                      className="min-h-11 rounded-md bg-surface px-2 text-sm text-fg shadow-border"
+                    >
+                      {SYSTEM_FONTS.map((f) => (
+                        <option key={f.family} value={f.family}>
+                          {f.label}
+                        </option>
+                      ))}
+                      {customFonts.map((f) => (
+                        <option key={f.family} value={f.family}>
+                          {f.label}
+                        </option>
+                      ))}
+                    </select>
+                    <label className="flex min-h-11 items-center gap-2 text-xs text-fg">
+                      <input
+                        type="checkbox"
+                        checked={selected.text.italic}
+                        onChange={(e) =>
+                          updatePlate(selected.id, {
+                            text: {
+                              ...selected.text!,
+                              italic: e.target.checked,
+                            },
+                          })
+                        }
+                        className="size-4 accent-fg"
+                      />
+                      Kursiv
+                    </label>
+                    <Field
+                      label="Schreibtempo"
+                      value={formatSpeed(selected.text.speed ?? 1)}
+                    >
+                      <Slider
+                        min={0.25}
+                        max={2.5}
+                        step={0.05}
+                        value={[selected.text.speed ?? 1]}
+                        onValueChange={(v) =>
+                          updatePlate(selected.id, {
+                            text: {
+                              ...selected.text!,
+                              speed: v[0] ?? 1,
+                            },
+                          })
+                        }
+                      />
+                    </Field>
+                    {selected.job ? (
+                      <p className="text-xs text-muted">
+                        Schreibdauer{" "}
+                        {formatMs(
+                          textWriteMs(
+                            selected.job.lineOrder.length,
+                            selected.text.speed ?? 1,
+                          ),
+                        )}
+                      </p>
+                    ) : null}
+                  </div>
+                ) : null}
                 <Field
                   label="Transparenz"
                   value={`${Math.round(shown.transparency)}%`}
@@ -1313,6 +1682,7 @@ export function Studio() {
                 <legend className="text-xs font-medium tracking-wide text-muted">
                   Ablauf
                 </legend>
+                {selected.kind === "text" ? null : (
                 <Field
                   label="Liniendauer"
                   value={formatMs(shown.timeline.lineMs)}
@@ -1335,6 +1705,8 @@ export function Studio() {
                     }
                   />
                 </Field>
+                )}
+                {selected.kind === "text" ? null : (
                 <Field
                   label="Töne"
                   value={formatMs(shown.timeline.toneMs)}
@@ -1357,6 +1729,7 @@ export function Studio() {
                     }
                   />
                 </Field>
+                )}
                 <Field
                   label="Halten"
                   value={formatMs(shown.timeline.holdMs)}

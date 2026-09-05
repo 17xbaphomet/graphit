@@ -139,9 +139,10 @@ function drawLines(
 ) {
   const n = Math.min(count, job.lineOrder.length);
   const src = job.rgba;
+  const all = job.toneOrder.length === 0;
   for (let k = 0; k < n; k++) {
     const i = job.lineOrder[k]!;
-    if (isLineMark(job, i)) writeOriginal(dest, src, i);
+    if (all || isLineMark(job, i)) writeOriginal(dest, src, i);
   }
 }
 
@@ -160,9 +161,10 @@ function drawLineRange(
   const src = job.rgba;
   const a = Math.max(0, from);
   const b = Math.min(job.lineOrder.length, to);
+  const all = job.toneOrder.length === 0;
   for (let k = a; k < b; k++) {
     const i = job.lineOrder[k]!;
-    if (isLineMark(job, i)) writeOriginal(dest, src, i);
+    if (all || isLineMark(job, i)) writeOriginal(dest, src, i);
   }
 }
 
@@ -183,7 +185,11 @@ function drawToneRange(
 
 function lineCountAt(job: GraphiteJob, phase: PhaseInfo): number {
   if (phase.kind === "lines") {
-    return Math.floor(easeInOutCubic(phase.local) * job.lineOrder.length);
+    const t =
+      job.toneOrder.length === 0
+        ? clamp01(phase.local)
+        : easeInOutCubic(phase.local);
+    return Math.floor(t * job.lineOrder.length);
   }
   return job.lineOrder.length;
 }
@@ -212,8 +218,12 @@ export function paintFrame(
   drawLineRange(dest, job, 0, job.lineOrder.length);
 
   if (phase.kind === "hold") {
-    dest.set(job.rgba);
-    knockPaper(dest, job.paper, key);
+    if (job.toneOrder.length > 0) {
+      dest.set(job.rgba);
+      knockPaper(dest, job.paper, key);
+    } else if (key > 0) {
+      knockPaper(dest, job.paper, key);
+    }
     return phase;
   }
 
@@ -303,7 +313,7 @@ export class GraphiteRenderer {
       if (tones > this.lastTone) {
         drawToneRange(dest, this.job, this.lastTone, tones);
       }
-      if (phase.kind === "hold") {
+      if (phase.kind === "hold" && this.job.toneOrder.length > 0) {
         dest.set(this.job.rgba);
         knockPaper(dest, this.job.paper, this.key);
       }

@@ -17,3 +17,6 @@ artifacts/
 .grok/
 public/__grok/
 AGENTS.md
+attachments/
+__pycache__/
+*.pyc

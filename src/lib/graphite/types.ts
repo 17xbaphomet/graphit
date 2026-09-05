@@ -51,6 +51,15 @@ export type FrameRect = {
   h: number;
 };
 
+export type TextSpec = {
+  content: string;
+  fontFamily: string;
+  fontWeight: number;
+  italic: boolean;
+  /** Writing speed. 1 = normal, 0.25 = slow, 2.5 = fast. */
+  speed: number;
+};
+
 export type Plate = {
   id: string;
   name: string;
@@ -66,6 +75,10 @@ export type Plate = {
   transparency: number;
   /** Per-setting: when true, this plate keeps its own value instead of the export master. */
   overrides: PlateOverrides;
+  kind?: "image" | "text";
+  text?: TextSpec;
+  fontFile?: File;
+  appliedText?: string;
 };
 
 export type MasterableKey =
