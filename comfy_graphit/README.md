@@ -5,14 +5,14 @@ Ordner nach `ComfyUI/custom_nodes/graphit` kopieren und Comfy neu starten.
 ## Nodes
 
 **Graphit Animate**
-- `image` … `image_7` — Platten (Reihenfolge = JSON-`image`-Index). Studio-UI und Engine nutzen dieselben 8 Slots.
+- `image` … `image_7` — Platten (Reihenfolge = JSON-`image`-Index). Studio-UI und Engine können acht Bilder; die Node zeigt dieselben acht Sockets.
 - `config` — JSON, das **alles** steuert (Bühne, Zeiten, Erkennung, Frames)
 - `json_file` — optionaler Pfad zu einer `.json` (überschreibt das Textfeld)
 - `fps` — `0` = Wert aus JSON
 
 Ausgabe: `frames` (IMAGE-Batch), `frame_count`, `duration_ms`.
 
-Familien-Board mit 6 Vignetten: `image` plus `image_1`…`image_5`. Textplatten brauchen keinen Slot.
+Familien-Boards mit sechs Vignetten: `image` … `image_5` verdrahten, in der Config `"image": 0` … `"image": 5`.
 
 **Graphit Config JSON** — Slider → JSON-String, den du in Animate steckst. `plates_json` ist das Array der Platten.
 

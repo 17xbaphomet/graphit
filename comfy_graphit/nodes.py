@@ -37,8 +37,7 @@ def _slot_key(i: int) -> str:
 def _images_from(kwargs: dict) -> list[np.ndarray]:
     out: list[np.ndarray] = []
     for i in range(IMAGE_SLOTS):
-        key = _slot_key(i)
-        val = kwargs.get(key)
+        val = kwargs.get(_slot_key(i))
         if val is None:
             continue
         if isinstance(val, torch.Tensor) and val.ndim == 4 and val.shape[0] > 1 and i == 0:
@@ -136,15 +135,15 @@ class GraphitAnimate:
     FUNCTION = "run"
     CATEGORY = CATEGORY
 
-    def run(self, image, config, json_file="", fps=0, **kwargs):
+    def run(self, image, config, json_file="", fps=0, **slots):
         raw = json_file.strip() if json_file and str(json_file).strip() else config
         cfg = load_config(raw)
         if fps and int(fps) > 0:
             cfg["fps"] = int(fps)
-        slots = {"image": image}
+        payload = {"image": image}
         for i in range(1, IMAGE_SLOTS):
-            slots[_slot_key(i)] = kwargs.get(_slot_key(i))
-        images = _images_from(slots)
+            payload[_slot_key(i)] = slots.get(_slot_key(i))
+        images = _images_from(payload)
         plates = _build_plates(cfg, images)
         stage = cfg["stage"]
         sw, sh = int(stage["width"]), int(stage["height"])
