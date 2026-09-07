@@ -113,7 +113,7 @@ def _frames_to_tensor(frames: list[np.ndarray]) -> torch.Tensor:
 class GraphitAnimate:
     @classmethod
     def INPUT_TYPES(cls):
-        optional = { _slot_key(i): ("IMAGE",) for i in range(1, IMAGE_SLOTS) }
+        optional = {f"image_{i}": ("IMAGE",) for i in range(1, IMAGE_SLOTS)}
         optional["json_file"] = ("STRING", {"default": ""})
         optional["fps"] = ("INT", {"default": 0, "min": 0, "max": 60, "step": 1})
         return {
@@ -136,13 +136,15 @@ class GraphitAnimate:
     FUNCTION = "run"
     CATEGORY = CATEGORY
 
-    def run(self, image, config, json_file="", fps=0, **slots):
+    def run(self, image, config, json_file="", fps=0, **kwargs):
         raw = json_file.strip() if json_file and str(json_file).strip() else config
         cfg = load_config(raw)
         if fps and int(fps) > 0:
             cfg["fps"] = int(fps)
-        payload = {"image": image, **slots}
-        images = _images_from(payload)
+        slots = {"image": image}
+        for i in range(1, IMAGE_SLOTS):
+            slots[_slot_key(i)] = kwargs.get(_slot_key(i))
+        images = _images_from(slots)
         plates = _build_plates(cfg, images)
         stage = cfg["stage"]
         sw, sh = int(stage["width"]), int(stage["height"])
