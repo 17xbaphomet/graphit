@@ -18,6 +18,7 @@ from .engine import (
 from .schema import dumps_example, load_config, params_from
 
 CATEGORY = "graphit"
+IMAGE_SLOTS = 8
 
 
 def _tensor_to_rgb(t: torch.Tensor) -> np.ndarray:
@@ -29,10 +30,14 @@ def _tensor_to_rgb(t: torch.Tensor) -> np.ndarray:
     return np.clip(arr, 0, 255).astype(np.uint8)
 
 
+def _slot_key(i: int) -> str:
+    return "image" if i == 0 else f"image_{i}"
+
+
 def _images_from(kwargs: dict) -> list[np.ndarray]:
     out: list[np.ndarray] = []
-    for i in range(8):
-        key = "image" if i == 0 else f"image_{i}"
+    for i in range(IMAGE_SLOTS):
+        key = _slot_key(i)
         val = kwargs.get(key)
         if val is None:
             continue
@@ -108,6 +113,9 @@ def _frames_to_tensor(frames: list[np.ndarray]) -> torch.Tensor:
 class GraphitAnimate:
     @classmethod
     def INPUT_TYPES(cls):
+        optional = { _slot_key(i): ("IMAGE",) for i in range(1, IMAGE_SLOTS) }
+        optional["json_file"] = ("STRING", {"default": ""})
+        optional["fps"] = ("INT", {"default": 0, "min": 0, "max": 60, "step": 1})
         return {
             "required": {
                 "image": ("IMAGE",),
@@ -120,14 +128,7 @@ class GraphitAnimate:
                     },
                 ),
             },
-            "optional": {
-                "image_1": ("IMAGE",),
-                "image_2": ("IMAGE",),
-                "image_3": ("IMAGE",),
-                "image_4": ("IMAGE",),
-                "json_file": ("STRING", {"default": ""}),
-                "fps": ("INT", {"default": 0, "min": 0, "max": 60, "step": 1}),
-            },
+            "optional": optional,
         }
 
     RETURN_TYPES = ("IMAGE", "INT", "INT")
@@ -135,20 +136,13 @@ class GraphitAnimate:
     FUNCTION = "run"
     CATEGORY = CATEGORY
 
-    def run(self, image, config, image_1=None, image_2=None, image_3=None, image_4=None, json_file="", fps=0):
+    def run(self, image, config, json_file="", fps=0, **slots):
         raw = json_file.strip() if json_file and str(json_file).strip() else config
         cfg = load_config(raw)
         if fps and int(fps) > 0:
             cfg["fps"] = int(fps)
-        images = _images_from(
-            {
-                "image": image,
-                "image_1": image_1,
-                "image_2": image_2,
-                "image_3": image_3,
-                "image_4": image_4,
-            }
-        )
+        payload = {"image": image, **slots}
+        images = _images_from(payload)
         plates = _build_plates(cfg, images)
         stage = cfg["stage"]
         sw, sh = int(stage["width"]), int(stage["height"])
