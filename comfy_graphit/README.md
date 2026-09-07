@@ -12,7 +12,7 @@ Ordner nach `ComfyUI/custom_nodes/graphit` kopieren und Comfy neu starten.
 
 Ausgabe: `frames` (IMAGE-Batch), `frame_count`, `duration_ms`.
 
-Familien-Boards mit sechs Vignetten: `image` … `image_5` verdrahten, in der Config `"image": 0` … `"image": 5`.
+Ein Board mit sechs Bildplatten: `image` … `image_5` verdrahten, in der Config `"image": 0` … `"image": 5`. Ob der Abschnitt Familie, Krieg oder eine Rede ist, entscheidet nicht Graphit.
 
 **Graphit Config JSON** — Slider → JSON-String, den du in Animate steckst. `plates_json` ist das Array der Platten.
 
