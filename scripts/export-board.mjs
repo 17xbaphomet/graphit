@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /** Headless Graphit Studio export: graphit.json + stills → webm via Playwright. */
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
-import { resolve, extname } from "node:path";
+import { readFileSync, writeFileSync, existsSync, readdirSync } from "node:fs";
+import { resolve, extname, join } from "node:path";
 import { chromium } from "playwright";
 
 function arg(name, fallback = "") {
@@ -21,27 +21,69 @@ function dataUrl(path) {
   return `data:${mime(path)};base64,${buf.toString("base64")}`;
 }
 
+function resolveStill(name, kind, spec, cfg, jobsByName, stillsDir) {
+  const candidates = [];
+  if (spec.file) candidates.push(spec.file);
+  const idx = spec.image;
+  if (typeof idx === "number" && cfg.images && cfg.images[idx]) {
+    candidates.push(cfg.images[idx]);
+  }
+  const job = jobsByName.get(name) || {};
+  if (job.file) candidates.push(job.file);
+  for (const key of ["flux_files", "files"]) {
+    const files = job[key] || [];
+    if (files.length) candidates.push(key === "flux_files" ? files[files.length - 1] : files[0]);
+  }
+  if (stillsDir && name) {
+    candidates.push(join(stillsDir, `${name}.png`));
+    try {
+      const hits = readdirSync(stillsDir)
+        .filter((f) => f.startsWith(`stack-${name}`) && f.endsWith(".png") && !f.includes("-ref-"))
+        .sort();
+      if (hits.length) candidates.push(join(stillsDir, hits[hits.length - 1]));
+    } catch {
+      /* no stills dir */
+    }
+  }
+  if (kind === "map" && name) {
+    candidates.push(`/tmp/${name}.png`);
+  }
+  for (const c of candidates) {
+    if (c && existsSync(c) && !String(c).includes("-ref-")) return c;
+  }
+  return null;
+}
+
 const configPath = resolve(arg("--config"));
 const outPath = resolve(arg("--out"));
 const url = arg("--url", process.env.GRAPHIT_URL || "http://127.0.0.1:8090");
+const jobsPath = arg("--jobs", process.env.GRAPHIT_JOBS || "/workspace/output/stack-run/jobs.json");
+const stillsDir = arg("--stills", process.env.GRAPHIT_STILLS || "/workspace/output/stack-run/stills");
 if (!configPath || !outPath || !existsSync(configPath)) {
-  console.error("usage: node export-board.mjs --config board.json --out clip.webm [--url http://127.0.0.1:8090]");
+  console.error("usage: node export-board.mjs --config board.json --out clip.webm [--url http://127.0.0.1:8090] [--jobs jobs.json] [--stills dir]");
   process.exit(2);
 }
 
 const cfg = JSON.parse(readFileSync(configPath, "utf8"));
-const images = cfg.images || [];
+const jobsByName = new Map();
+if (existsSync(jobsPath)) {
+  for (const j of JSON.parse(readFileSync(jobsPath, "utf8"))) {
+    if (j?.name) jobsByName.set(j.name, j);
+  }
+}
+
 const plates = [];
 for (const spec of cfg.plates || []) {
   if ((spec.kind || "image") === "text") continue;
-  const idx = spec.image;
-  const file = spec.file || (typeof idx === "number" ? images[idx] : null);
-  if (!file || !existsSync(file)) {
-    console.error("missing still", spec.name, file);
+  const name = spec.name || "plate";
+  const file = resolveStill(name, spec.kind || "", spec, cfg, jobsByName, stillsDir);
+  if (!file) {
+    console.error("missing still", name);
     continue;
   }
+  console.error("still", name, "←", file);
   plates.push({
-    name: spec.name || "plate",
+    name,
     dataUrl: dataUrl(file),
     frame: spec.frame || { x: 0.04, y: 0.04, w: 0.92, h: 0.92 },
     startMs: spec.startMs || 0,
